@@ -1,0 +1,2 @@
+# Conflicting histories require evidence reconciliation, not automatic union.
+ledger.jsonl text eol=lf

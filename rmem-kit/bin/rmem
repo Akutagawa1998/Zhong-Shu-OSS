@@ -1,0 +1,1108 @@
+#!/usr/bin/env python3
+"""Tool-neutral research memory for a shared local POSIX filesystem.
+
+The CLI bounds context output, records evidence, and coordinates cooperative
+sessions. It does not isolate source worktrees, reserve GPUs, or distribute locks
+between independently cloned hubs. Markdown remains ordinary, editable data.
+"""
+import argparse
+from collections import deque
+from contextlib import contextmanager
+import datetime as dt
+import errno
+import fcntl
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+STATE_MAX_LINES = 120
+THREAD_MAX_LINES = 80
+STATE_MAX_CHARS = 8000
+THREAD_MAX_CHARS = 6000
+OUTPUT_MAX_CHARS = 16000
+LINE_MAX_CHARS = 1200
+EVENT_MAX_CHARS = 65536
+STALE_CLAIM_HOURS = 12
+BLOCK_START, BLOCK_END = "<!-- RMEM:START -->", "<!-- RMEM:END -->"
+SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}\Z")
+SAFE_SESSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:@+-]{0,127}\Z")
+
+
+class RmemError(Exception):
+    """An actionable validation or operational error, without a traceback."""
+
+
+def now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="microseconds")
+
+
+def identifier(value: str) -> str:
+    if not SAFE_ID.fullmatch(value):
+        raise argparse.ArgumentTypeError("use 1–80 letters/digits/._-; start with a letter or digit")
+    return value
+
+
+def count(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected an integer from 0 to 100") from exc
+    if not 0 <= number <= 100:
+        raise argparse.ArgumentTypeError("expected an integer from 0 to 100")
+    return number
+
+
+def regex(value: str):
+    try:
+        return re.compile(value)
+    except re.error as exc:
+        raise argparse.ArgumentTypeError(f"invalid regex: {exc}") from exc
+
+
+def one_line(value: str, name: str, limit: int = 1000) -> str:
+    if not value.strip() or len(value) > limit or any(c in value for c in "\r\n\0"):
+        raise RmemError(f"{name} must be one nonempty line of at most {limit} characters")
+    return value
+
+
+def actor(a, required: bool = False) -> dict:
+    who = a.agent or os.environ.get("RMEM_AGENT")
+    if not who:
+        who = "claude" if os.environ.get("CLAUDECODE") else (
+            "codex" if any(k.startswith("CODEX_") for k in os.environ) else "human")
+    try:
+        identifier(who)
+    except argparse.ArgumentTypeError as exc:
+        raise RmemError(f"invalid agent label: {exc}") from exc
+    session = a.session or os.environ.get("RMEM_SESSION")
+    if required and not session:
+        raise RmemError("set a unique RMEM_SESSION (or --session) for this working session")
+    if session and not SAFE_SESSION.fullmatch(session):
+        raise RmemError("session must be 1–128 letters/digits/._:@+- and start with a letter or digit")
+    result = {"agent": who}
+    if session:
+        result["session"] = session
+    return result
+
+
+def safe_path(root: Path, *parts: str) -> Path:
+    """Reject traversal and symlink components beneath an already resolved root."""
+    current = root
+    for value in parts:
+        part = Path(value)
+        if part.is_absolute() or ".." in part.parts:
+            raise RmemError(f"path must stay inside the hub: {value}")
+        for name in part.parts:
+            current = current / name
+            if current.is_symlink():
+                raise RmemError(f"refusing symlink: {current}")
+    return current
+
+
+def open_regular(path: Path, flags: int, mode: str):
+    # O_NONBLOCK lets us reject FIFOs before an accidental open can hang.
+    fd = os.open(path, flags | getattr(os, "O_NOFOLLOW", 0) | os.O_NONBLOCK, 0o600)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise RmemError(f"expected a regular file: {path}")
+    return os.fdopen(fd, mode, encoding="utf-8", errors="replace")
+
+
+@contextmanager
+def hub_lock(hub: Path, shared: bool = False):
+    lock = safe_path(hub, ".rmem.lock")
+    with open_regular(lock, os.O_CREAT | os.O_RDWR, "a+") as stream:
+        fcntl.flock(stream, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(stream, fcntl.LOCK_UN)
+
+
+@contextmanager
+def directory_lock(directory: Path):
+    fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def atomic_write(path: Path, text: str) -> None:
+    if path.is_symlink():
+        raise RmemError(f"refusing symlink: {path}")
+    mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open_regular(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, "w") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.chmod(mode)
+        if path.is_symlink():
+            raise RmemError(f"refusing symlink: {path}")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def validate_hub(hub: Path) -> Path:
+    if not hub.is_dir():
+        raise RmemError(f"hub directory does not exist: {hub}")
+    for name in ("STATE.md", "ledger.jsonl"):
+        if not safe_path(hub, name).is_file():
+            raise RmemError(f"not an initialized hub: missing {name} in {hub}")
+    for name in ("threads", "claims", "journal", "findings"):
+        if not safe_path(hub, name).is_dir():
+            raise RmemError(f"not an initialized hub: missing {name}/ in {hub}")
+    return hub
+
+
+def pointer_target(pointer: Path) -> Path:
+    if pointer.is_symlink():
+        raise RmemError(f"refusing symlink: {pointer}")
+    value = pointer.read_text(encoding="utf-8")
+    value = one_line(value.rstrip("\n"), str(pointer), 4096)
+    target = Path(value).expanduser()
+    return (target if target.is_absolute() else pointer.parent / target).resolve()
+
+
+def find_hub() -> Path:
+    if os.environ.get("RMEM_HUB"):
+        return validate_hub(Path(os.environ["RMEM_HUB"]).expanduser().resolve())
+    current = Path.cwd().resolve()
+    for directory in (current, *current.parents):
+        pointer = directory / ".rmem"
+        if pointer.exists() or pointer.is_symlink():
+            return validate_hub(pointer_target(pointer))
+        if (directory / "STATE.md").is_file() and (directory / "ledger.jsonl").exists():
+            return validate_hub(directory)
+    raise RmemError("no hub found; set RMEM_HUB or run `rmem link PROJECT` from the hub")
+
+
+def clipped(value, limit: int = 400) -> str:
+    text = str(value).replace("\r", " ").replace("\n", " ")
+    return text if len(text) <= limit else text[:limit - 14] + " … [truncated]"
+
+
+class Output:
+    def __init__(self):
+        self.parts = []
+        self.remaining = OUTPUT_MAX_CHARS - 40
+        self.truncated = False
+
+    def add(self, value=""):
+        if not self.remaining:
+            self.truncated = True
+            return
+        text = str(value) + "\n"
+        if len(text) <= self.remaining:
+            self.parts.append(text)
+            self.remaining -= len(text)
+        else:
+            self.parts.append(text[:self.remaining])
+            self.remaining = 0
+            self.truncated = True
+
+    def emit(self):
+        sys.stdout.write("".join(self.parts))
+        if self.truncated:
+            sys.stdout.write("\n[output truncated; narrow the query]\n")
+
+
+def bounded_lines(path: Path, limit: int = LINE_MAX_CHARS):
+    """Yield line prefixes without ever allocating a complete giant log line."""
+    with open_regular(path, os.O_RDONLY, "r") as stream:
+        while True:
+            line = stream.readline(limit + 1)
+            if not line:
+                break
+            truncated = len(line) > limit and not line.endswith("\n")
+            if truncated:
+                while line and not line.endswith("\n"):
+                    tail = stream.readline(65536)
+                    if not tail or tail.endswith("\n"):
+                        break
+            yield line[:limit].rstrip("\r\n"), truncated
+
+
+def text_excerpt(path: Path, max_lines: int, max_chars: int) -> str:
+    result, used = [], 0
+    for index, (line, truncated) in enumerate(bounded_lines(path)):
+        if index >= max_lines or used + len(line) + 1 > max_chars:
+            result.append("[text truncated; read a specific section]")
+            break
+        result.append(line + (" [line truncated]" if truncated else ""))
+        used += len(result[-1]) + 1
+    return "\n".join(result)
+
+
+def event_problem(event) -> str:
+    if not isinstance(event, dict):
+        return "event must be a JSON object"
+    for name in ("ts", "kind"):
+        if not isinstance(event.get(name), str) or not event[name]:
+            return f"event requires string {name}"
+    try:
+        parsed = dt.datetime.fromisoformat(event["ts"])
+        if parsed.tzinfo is None:
+            return "event timestamp requires a timezone"
+    except ValueError:
+        return "invalid event timestamp"
+    for name in ("agent", "session", "id", "thread", "status", "note", "commit", "log",
+                 "source_id", "source_namespace", "run_id", "host", "scheduler", "job_id",
+                 "event_id", "event_time", "supersedes"):
+        if event.get(name) is not None and not isinstance(event[name], str):
+            return f"event {name} must be a string"
+    metrics = event.get("metrics")
+    if metrics is not None:
+        if not isinstance(metrics, dict):
+            return "event metrics must be an object"
+        for value in metrics.values():
+            if not isinstance(value, (str, float, int)) or isinstance(value, bool):
+                return "metric values must be strings or finite numbers"
+            if isinstance(value, float) and not math.isfinite(value):
+                return "metric numbers must be finite"
+    if "sources" in event:
+        if not isinstance(event["sources"], list) or any(
+                not isinstance(source, dict) or not isinstance(source.get("path"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", str(source.get("sha256", "")))
+                for source in event["sources"]):
+            return "invalid source evidence records"
+    for name in ("argv", "artifacts"):
+        if name in event and (not isinstance(event[name], list) or
+                              any(not isinstance(value, str) for value in event[name])):
+            return f"event {name} must be a list of strings"
+    if "provenance" in event and not isinstance(event["provenance"], dict):
+        return "event provenance must be an object"
+    if "dirty" in event and not isinstance(event["dirty"], bool):
+        return "event dirty must be a boolean"
+    if "exit_code" in event and (not isinstance(event["exit_code"], int) or isinstance(event["exit_code"], bool)):
+        return "event exit_code must be an integer"
+    if "secs" in event and (not isinstance(event["secs"], (float, int)) or
+                             isinstance(event["secs"], bool) or not math.isfinite(event["secs"]) or event["secs"] < 0):
+        return "event secs must be a nonnegative finite number"
+    if "evidence_level" in event and event["evidence_level"] not in ("observed", "reported", "inferred"):
+        return "invalid evidence level"
+    return ""
+
+
+def events_locked(hub: Path):
+    for number, (line, truncated) in enumerate(bounded_lines(safe_path(hub, "ledger.jsonl"), EVENT_MAX_CHARS), 1):
+        if not line.strip() and not truncated:
+            continue
+        try:
+            event = json.loads(line) if not truncated else None
+            problem = "event exceeds size limit" if truncated else event_problem(event)
+        except (json.JSONDecodeError, RecursionError):
+            event, problem = None, "invalid JSON"
+        if problem:
+            yield {"ts": "?", "kind": "CORRUPT", "note": f"line {number}: {problem}"}
+        else:
+            yield event
+
+
+def append_locked(hub: Path, event: dict) -> dict:
+    event = {"ts": now(), "event_id": uuid.uuid4().hex,
+             "host": socket.gethostname(), **event,
+             "recorded_host": socket.gethostname(), "cwd": str(Path.cwd())}
+    problem = event_problem(event)
+    if problem:
+        raise RmemError(problem)
+    encoded = json.dumps(event, ensure_ascii=False, allow_nan=False)
+    if len(encoded) > EVENT_MAX_CHARS - 1:
+        raise RmemError(f"event exceeds {EVENT_MAX_CHARS - 1} characters; use evidence pointers")
+    with open_regular(safe_path(hub, "ledger.jsonl"), os.O_WRONLY | os.O_APPEND, "a") as stream:
+        stream.write(encoded + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    return event
+
+
+def fmt_event(event: dict) -> str:
+    bits = [event.get("ts", "?")[:19], clipped(event.get("agent", "?"), 80), event["kind"]]
+    for name in ("id", "thread", "status", "job_id"):
+        if event.get(name):
+            bits.append(f"{name}={clipped(event[name], 100)}")
+    if event.get("metrics"):
+        bits.append(clipped(" ".join(f"{k}={v}" for k, v in event["metrics"].items()), 300))
+    if event.get("commit"):
+        bits.append("@" + event["commit"][:12] + ("+dirty" if event.get("dirty") else ""))
+    if event.get("note"):
+        bits.append("— " + clipped(event["note"]))
+    return " | ".join(bits)
+
+
+def load_claim(hub: Path, slug: str):
+    directory = safe_path(hub, "claims", slug)
+    if not directory.exists():
+        return None, "no claim"
+    if not directory.is_dir():
+        return None, "claim is not a directory"
+    meta = safe_path(hub, "claims", slug, "meta.json")
+    if not meta.is_file():
+        return {}, "claim is missing meta.json"
+    if meta.stat().st_size > 8192:
+        return {}, "claim metadata exceeds size limit"
+    try:
+        record = json.loads(meta.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeError):
+        return {}, "claim metadata is invalid JSON"
+    if not isinstance(record, dict):
+        return {}, "claim metadata must be an object"
+    if not isinstance(record.get("agent"), str) or not isinstance(record.get("session"), str):
+        return record, "claim requires a session owner (legacy claims need explicit recovery)"
+    if not SAFE_SESSION.fullmatch(record["session"]):
+        return record, "claim has an invalid session owner"
+    try:
+        timestamp = dt.datetime.fromisoformat(record["ts"])
+        if timestamp.tzinfo is None:
+            return record, "claim timestamp requires a timezone"
+    except (ValueError, KeyError, TypeError):
+        return record, "claim has an invalid timestamp"
+    return record, ""
+
+
+def require_claim(hub: Path, slug: str, who: dict):
+    meta, problem = load_claim(hub, slug)
+    if problem:
+        raise RmemError(f"thread '{slug}': {problem}; claim it before writing or running")
+    if meta["session"] != who["session"]:
+        raise RmemError(f"thread '{slug}' belongs to session {clipped(meta['session'])}, not this session")
+    return meta
+
+
+def force_reason(a):
+    if a.force and not a.reason:
+        raise RmemError("--force requires --reason describing the explicit recovery decision")
+    if a.reason:
+        one_line(a.reason, "reason")
+    if a.reason and not a.force:
+        raise RmemError("--reason is only used with --force")
+
+
+def active_runs(hub: Path, slug: str) -> set:
+    active = set()
+    for event in events_locked(hub):
+        if event.get("thread") != slug or not event.get("run_id"):
+            continue
+        if event["kind"] == "run_started":
+            active.add(event["run_id"])
+        elif event["kind"] == "run":
+            active.discard(event["run_id"])
+    return active
+
+
+THREAD_TEMPLATE = """# Thread: {slug}
+
+## Question / hypothesis
+(What result would change your mind?)
+
+## Plan
+1.
+
+## Next step
+(The single next action.)
+
+## Results so far
+(Experiment IDs and evidence pointers, with observed/reported/inferred labels.)
+
+## Dead ends
+(What was tried and why it failed.)
+"""
+
+
+def cmd_claim(a):
+    hub, who = find_hub(), actor(a, required=True)
+    force_reason(a)
+    if a.note is not None:
+        one_line(a.note, "note")
+    with hub_lock(hub):
+        directory = safe_path(hub, "claims", a.slug)
+        previous, problem = load_claim(hub, a.slug)
+        if previous is not None or directory.exists():
+            if not problem and previous["session"] == who["session"] and not a.force:
+                print(f"already held by this session: {a.slug}")
+                return 0
+            if not a.force:
+                raise RmemError(f"thread '{a.slug}' is claimed: {problem or previous['session']}; choose another thread")
+        thread = safe_path(hub, "threads", f"{a.slug}.md")
+        if not directory.exists():
+            directory.mkdir()
+        if not thread.exists():
+            atomic_write(thread, THREAD_TEMPLATE.format(slug=a.slug))
+        metadata = {**who, "ts": now(), "host": socket.gethostname(), "pid": os.getpid(), "note": a.note or ""}
+        atomic_write(safe_path(hub, "claims", a.slug, "meta.json"), json.dumps(metadata, ensure_ascii=False) + "\n")
+        event = {**who, "kind": "claim", "thread": a.slug, "note": a.note}
+        if a.force:
+            event.update(previous_owner=previous, previous_owner_problem=problem, reason=a.reason)
+        append_locked(hub, event)
+    print(f"claimed {a.slug} for session {who['session']} → {thread}")
+    return 0
+
+
+def cmd_release(a):
+    hub, who = find_hub(), actor(a, required=True)
+    force_reason(a)
+    if a.note is not None:
+        one_line(a.note, "note")
+    with hub_lock(hub):
+        directory = safe_path(hub, "claims", a.slug)
+        if not directory.is_dir():
+            raise RmemError(f"no claim on '{a.slug}'")
+        previous, problem = load_claim(hub, a.slug)
+        if not a.force:
+            require_claim(hub, a.slug, who)
+            if active_runs(hub, a.slug):
+                raise RmemError("thread has an unfinished run; keep the claim, or use explicit recovery after checking the process")
+        unexpected = [p.name for p in directory.iterdir() if p.name != "meta.json"]
+        if unexpected:
+            raise RmemError(f"refusing to delete unexpected claim contents: {clipped(unexpected)}")
+        meta = safe_path(hub, "claims", a.slug, "meta.json")
+        meta.unlink(missing_ok=True)
+        directory.rmdir()
+        event = {**who, "kind": "release", "thread": a.slug, "note": a.note}
+        if a.force:
+            event.update(previous_owner=previous, previous_owner_problem=problem, reason=a.reason)
+        append_locked(hub, event)
+    print(f"released {a.slug}")
+    return 0
+
+
+def cmd_status(a):
+    hub = find_hub()
+    out = Output()
+    with hub_lock(hub, shared=True):
+        out.add(f"# rmem hub: {hub}\n")
+        out.add(text_excerpt(safe_path(hub, "STATE.md"), STATE_MAX_LINES, STATE_MAX_CHARS))
+        out.add("\n## Threads")
+        threads = sorted(safe_path(hub, "threads").glob("*.md"))
+        if not threads:
+            out.add("(none yet; `rmem claim SLUG` creates one)")
+        for thread in threads[:40]:
+            try:
+                meta, problem = load_claim(hub, thread.stem)
+                owner = "free" if meta is None else ("INVALID: " + problem if problem else
+                        f"{meta['agent']} / {meta['session']} since {meta['ts'][:19]}")
+            except RmemError as exc:
+                owner = "INVALID: " + str(exc)
+            out.add(f"- {clipped(thread.stem, 80)}: {clipped(owner, 220)}")
+        if len(threads) > 40:
+            out.add(f"[thread list truncated: {len(threads)} total; select --thread]")
+        recent, unfinished = deque(maxlen=a.n), {}
+        for event in events_locked(hub):
+            if event["kind"] == "run_started" and event.get("run_id"):
+                unfinished[event["run_id"]] = event
+            elif event["kind"] == "run":
+                unfinished.pop(event.get("run_id"), None)
+            elif a.n:
+                recent.append(event)
+        if unfinished:
+            out.add("\n## Unfinished attempts (completion unknown; verify the process/job)")
+            for event in list(unfinished.values())[-10:]:
+                out.add("- " + " ".join(f"{name}={clipped(event.get(name, '?'), 160)}"
+                                        for name in ("id", "thread", "run_id", "log")))
+            if len(unfinished) > 10:
+                out.add(f"[showing 10 of {len(unfinished)} unfinished attempts]")
+        out.add(f"\n## Last {len(recent)} ledger events")
+        for event in recent:
+            out.add("- " + fmt_event(event))
+        if a.thread:
+            thread = safe_path(hub, "threads", f"{a.thread}.md")
+            out.add(f"\n## threads/{a.thread}.md")
+            out.add(text_excerpt(thread, THREAD_MAX_LINES, THREAD_MAX_CHARS) if thread.exists() else "(missing)")
+    out.emit()
+    return 0
+
+
+def cmd_recent(a):
+    hub = find_hub()
+    recent = deque(maxlen=a.n)
+    if a.n:
+        with hub_lock(hub, shared=True):
+            for event in events_locked(hub):
+                if a.kind and event["kind"] != a.kind:
+                    continue
+                if a.thread and event.get("thread") != a.thread:
+                    continue
+                if a.grep and not a.grep.search(json.dumps(event, ensure_ascii=False)):
+                    continue
+                recent.append(event)
+    out = Output()
+    for event in recent:
+        out.add(fmt_event(event))
+    out.emit()
+    return 0
+
+
+def run_git(path: Path, *args, check: bool = True):
+    try:
+        result = subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RmemError(f"git failed: {clipped(exc)}") from exc
+    if check and result.returncode:
+        raise RmemError(f"git {' '.join(args[:2])} failed ({result.returncode}): {clipped(result.stderr, 1200)}")
+    return result
+
+
+def provenance(path: Path) -> dict:
+    if shutil.which("git") is None:
+        return {"git": False, "git_error": "git executable unavailable", "captured_at": now()}
+    root = run_git(path, "rev-parse", "--show-toplevel", check=False)
+    if root.returncode:
+        return {"git": False, "captured_at": now()}
+    head = run_git(path, "rev-parse", "--verify", "HEAD", check=False)
+    status_text = run_git(path, "status", "--porcelain=v1", "--untracked-files=all").stdout
+    return {"git": True, "repository": root.stdout.strip(), "commit": head.stdout.strip() or None,
+            "dirty": bool(status_text), "status_sha256": hashlib.sha256(status_text.encode()).hexdigest(),
+            "captured_at": now()}
+
+
+def source_records(paths) -> list:
+    sources = []
+    for value in paths or []:
+        path = Path(value).expanduser().resolve()
+        if not path.is_file():
+            raise RmemError(f"source must be an existing local file: {path}")
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            before = os.fstat(stream.fileno())
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+            after = os.fstat(stream.fileno())
+        if (before.st_size, before.st_mtime_ns, before.st_ino) != (after.st_size, after.st_mtime_ns, after.st_ino):
+            raise RmemError(f"source changed while hashing: {path}")
+        record = {"path": str(path), "sha256": digest.hexdigest(), "bytes": after.st_size,
+                  "input": value, "base": str(Path.cwd())}
+        if not Path(value).expanduser().is_absolute():
+            record["relative_path"] = value
+        if not any(source["path"] == record["path"] for source in sources):
+            sources.append(record)
+    return sorted(sources, key=lambda source: source["path"])
+
+
+def extra_metadata(a, default_evidence="reported") -> dict:
+    result = {"evidence_level": a.evidence_level or default_evidence}
+    for name in ("job_id", "scheduler", "host"):
+        value = getattr(a, name)
+        if value:
+            result[name] = one_line(value, name, 256)
+            if name == "host":
+                result["evidence_host"] = value
+    if a.artifact:
+        result["artifacts"] = [one_line(value, "artifact", 2000) for value in a.artifact]
+    return result
+
+
+def parse_metrics(values) -> dict:
+    metrics = {}
+    for item in values or []:
+        key, separator, value = item.partition("=")
+        if not separator or not key or not value or key in metrics:
+            raise RmemError("metrics require unique nonempty name=value pairs")
+        one_line(key, "metric name", 100)
+        one_line(value, "metric value", 1000)
+        try:
+            numeric = float(value)
+        except ValueError:
+            metrics[key] = value
+        else:
+            if not math.isfinite(numeric):
+                raise RmemError("metric numbers must be finite")
+            metrics[key] = numeric
+    return metrics
+
+
+def import_fingerprint(event: dict) -> str:
+    fields = ("kind", "id", "thread", "status", "hyp", "metrics", "commit", "where", "note",
+              "sources", "source_namespace", "source_id", "job_id", "scheduler", "artifacts", "evidence_level",
+              "event_time", "supersedes", "evidence_host")
+    payload = {key: event[key] for key in fields if event.get(key) is not None}
+    if "sources" in payload:
+        # Locations belong to the preserved receipt, not evidence identity: a
+        # project move, renamed copy, or repeated source must not create a run.
+        evidence = {}
+        for source in payload["sources"]:
+            content = {key: source[key] for key in ("sha256", "bytes") if key in source}
+            evidence[json.dumps(content, sort_keys=True)] = content
+        payload["sources"] = [evidence[key] for key in sorted(evidence)]
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def cmd_log(a):
+    hub, who = find_hub(), actor(a, required=bool(a.thread))
+    sources = source_records(a.source)
+    event = {**who, "kind": a.kind, **extra_metadata(a)}
+    for name in ("id", "thread", "status", "hyp", "commit", "where", "note", "supersedes"):
+        value = getattr(a, name)
+        if value is not None:
+            event[name] = one_line(value, name)
+    if a.event_time:
+        try:
+            timestamp = dt.datetime.fromisoformat(a.event_time.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise RmemError("--event-time must be an ISO 8601 timestamp with a timezone") from exc
+        if timestamp.tzinfo is None:
+            raise RmemError("--event-time must include a timezone")
+        event["event_time"] = timestamp.isoformat()
+    metrics = parse_metrics(a.metric)
+    if metrics:
+        event["metrics"] = metrics
+    if sources:
+        event["sources"] = sources
+    if a.kind == "import":
+        if not a.source_namespace or not a.source_id or not sources:
+            raise RmemError("imports require --source-namespace, --source-id and at least one --source local file")
+        event.update(source_namespace=one_line(a.source_namespace, "source namespace", 200),
+                     source_id=one_line(a.source_id, "source ID", 500))
+        event["import_fingerprint"] = import_fingerprint(event)
+    elif a.source_namespace or a.source_id:
+        raise RmemError("--source-namespace and --source-id are only used with --kind import")
+    elif not a.commit:
+        code = provenance(Path.cwd())
+        event["provenance"] = code
+        if code.get("commit"):
+            event.update(commit=code["commit"], dirty=code["dirty"])
+    with hub_lock(hub):
+        if a.thread:
+            require_claim(hub, a.thread, who)
+        if a.kind == "import":
+            for previous in events_locked(hub):
+                if previous["kind"] == "CORRUPT":
+                    raise RmemError("repair the corrupt ledger before importing; deduplication cannot be guaranteed")
+                if (previous.get("source_namespace"), previous.get("source_id")) == (a.source_namespace, a.source_id):
+                    if import_fingerprint(previous) == event["import_fingerprint"]:
+                        print(f"already imported: {a.source_namespace}/{a.source_id}")
+                        return 0
+                    raise RmemError("conflicting evidence or content for this source namespace/ID; inspect the existing import")
+        event = append_locked(hub, event)
+    out = Output()
+    out.add("logged: " + fmt_event(event))
+    out.emit()
+    return 0
+
+
+def cmd_note(a):
+    hub, who = find_hub(), actor(a, required=True)
+    one_line(a.text, "note", 4000)
+    name = f"{dt.date.today().isoformat()}-{who['agent']}-{who['session']}.md"
+    with hub_lock(hub):
+        path = safe_path(hub, "journal", name)
+        with open_regular(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, "a") as stream:
+            stream.write(f"- {now()} {a.text}\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+    print(f"noted → {path.name}")
+    return 0
+
+
+def cmd_run(a):
+    hub, who = find_hub(), actor(a, required=True)
+    command = a.cmd[1:] if a.cmd and a.cmd[0] == "--" else a.cmd
+    if not command:
+        raise RmemError("usage: rmem run --id E001 --thread SLUG -- COMMAND ...")
+    metadata = extra_metadata(a, "observed")
+    code = provenance(Path.cwd())  # The experiment must retain its starting revision.
+    run_id = uuid.uuid4().hex
+    relative_log = f"runs/{a.id}/{run_id}.log"
+    common = {**who, **metadata, "id": a.id, "thread": a.thread, "run_id": run_id,
+              "log": relative_log, "argv": command, "provenance": code}
+    if code.get("commit"):
+        common.update(commit=code["commit"], dirty=code["dirty"])
+    # Reserve space for timestamps, errors, and terminal fields before launching.
+    if len(json.dumps(common, ensure_ascii=False)) > EVENT_MAX_CHARS - 4096:
+        raise RmemError("run metadata exceeds the event size budget; shorten arguments or artifact pointers")
+    process = None
+    interrupted = [None, None]
+
+    def forward(signum, _frame):
+        if interrupted[0] is None:
+            interrupted[:] = [signum, time.monotonic()]
+        if process is not None:
+            try:
+                os.killpg(process.pid, signum)
+            except ProcessLookupError:
+                pass
+
+    previous_handlers = {sig: signal.signal(sig, forward) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    started = False
+    status_name, returncode, error = "launch_failed", 127, None
+    t0 = time.monotonic()
+    try:
+        with hub_lock(hub):
+            require_claim(hub, a.thread, who)
+            directory = safe_path(hub, "runs", a.id)
+            directory.mkdir(parents=True, exist_ok=True)
+            logfile = safe_path(hub, relative_log)
+            output = open_regular(logfile, os.O_WRONLY | os.O_CREAT | os.O_EXCL, "w")
+            try:
+                append_locked(hub, {**common, "kind": "run_started", "status": "running"})
+            except BaseException:
+                output.close()
+                raise
+            started = True
+        with output:
+            if interrupted[0] is None:
+                try:
+                    process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+                    while True:
+                        try:
+                            returncode = process.wait(timeout=.1)
+                            break
+                        except subprocess.TimeoutExpired:
+                            if interrupted[0] is not None and time.monotonic() - interrupted[1] > 5:
+                                try:
+                                    os.killpg(process.pid, signal.SIGKILL)
+                                except ProcessLookupError:
+                                    pass
+                    status_name = "ok" if returncode == 0 else "crash"
+                except OSError as exc:
+                    error = clipped(exc, 1000)
+                    output.write("rmem launch failed: " + error + "\n")
+                    returncode = 127 if exc.errno == errno.ENOENT else 126
+            if interrupted[0] is not None:
+                status_name, returncode = "interrupted", 128 + interrupted[0]
+            elif returncode < 0:
+                status_name, returncode = "interrupted", 128 - returncode
+            output.flush()
+            os.fsync(output.fileno())
+    finally:
+        try:
+            if started:
+                final = {**common, "kind": "run", "status": status_name,
+                         "exit_code": returncode, "secs": round(time.monotonic() - t0, 3)}
+                if error:
+                    final["error"] = error
+                if interrupted[0] is not None:
+                    final["signal"] = interrupted[0]
+                with hub_lock(hub):
+                    append_locked(hub, final)
+        finally:
+            for sig, handler in previous_handlers.items():
+                signal.signal(sig, handler)
+    hits, tail = deque(maxlen=a.max_lines), deque(maxlen=a.tail)
+    line_count = 0
+    for line, truncated in bounded_lines(logfile):
+        line_count += 1
+        display = line + (" [line truncated]" if truncated else "")
+        tail.append(display)
+        if a.grep.search(line):
+            hits.append(display)
+    out = Output()
+    out.add(f"exit={returncode} status={status_name} time={time.monotonic() - t0:.1f}s lines={line_count} log={logfile}")
+    if hits:
+        out.add("--- metric lines ---")
+        for line in hits:
+            out.add(line)
+    if returncode and tail:
+        out.add(f"--- last {len(tail)} lines (failed) ---")
+        for line in tail:
+            out.add(line)
+    out.emit()
+    return returncode
+
+
+def cmd_check(a):
+    hub = find_hub()
+    out, failures = Output(), 0
+
+    def problem(message):
+        nonlocal failures
+        failures += 1
+        out.add("! " + message)
+
+    with hub_lock(hub, shared=True):
+        files = [(safe_path(hub, "STATE.md"), STATE_MAX_LINES, STATE_MAX_CHARS)]
+        files += [(p, THREAD_MAX_LINES, THREAD_MAX_CHARS) for p in safe_path(hub, "threads").glob("*.md")]
+        for path, line_cap, char_cap in files:
+            try:
+                safe_path(hub, str(path.relative_to(hub)))
+                nlines = sum(1 for _ in bounded_lines(path))
+                if nlines > line_cap or path.stat().st_size > char_cap:
+                    problem(f"{path.relative_to(hub)} exceeds context cap ({line_cap} lines / {char_cap} bytes)")
+            except RmemError as exc:
+                problem(str(exc))
+        for directory in sorted(safe_path(hub, "claims").iterdir()):
+            if directory.name == ".gitkeep":
+                continue
+            try:
+                identifier(directory.name)
+                meta, error = load_claim(hub, directory.name)
+                if error:
+                    problem(f"claim '{directory.name}': {error}")
+                elif (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(meta["ts"])).total_seconds() > STALE_CLAIM_HOURS * 3600:
+                    problem(f"claim '{directory.name}' is older than {STALE_CLAIM_HOURS}h; check its owner and jobs")
+            except (RmemError, argparse.ArgumentTypeError) as exc:
+                problem(str(exc))
+        imports = {}
+        active = set()
+        for event in events_locked(hub):
+            if event["kind"] == "CORRUPT":
+                problem("ledger: " + event["note"])
+            if event["kind"] == "import" and event.get("source_id"):
+                key = (event.get("source_namespace"), event["source_id"])
+                fingerprint = import_fingerprint(event)
+                if key in imports and imports[key] != fingerprint:
+                    problem(f"ledger: conflicting imports for {key}")
+                imports[key] = fingerprint
+            if event["kind"] == "run_started" and event.get("run_id"):
+                active.add(event["run_id"])
+            elif event["kind"] == "run":
+                active.discard(event.get("run_id"))
+        if active:
+            out.add(f"info: {len(active)} unfinished run(s); may still be running, inspect before recovery")
+    if not failures:
+        out.add("ok")
+    out.emit()
+    return 1 if failures else 0
+
+
+def marker_span(text: str, name: str):
+    starts, ends = text.count(BLOCK_START), text.count(BLOCK_END)
+    if not starts and not ends:
+        return None
+    if starts != 1 or ends != 1 or text.index(BLOCK_START) > text.index(BLOCK_END):
+        raise RmemError(f"malformed or duplicate RMEM markers in {name}; repair before linking")
+    start, end = text.index(BLOCK_START), text.index(BLOCK_END) + len(BLOCK_END)
+    if text[end:end + 1] == "\n":
+        end += 1
+    return start, end
+
+
+def append_block(text: str, block: str) -> str:
+    separator = "" if not text else ("\n" if text.endswith("\n") else "\n\n")
+    return text + separator + block
+
+
+def cmd_link(a):
+    hub, who = find_hub(), actor(a)
+    project = Path(a.project_dir).expanduser().resolve()
+    if not project.is_dir():
+        raise RmemError(f"project is not a directory: {project}")
+    relative = os.path.relpath(hub, project)
+    one_line(relative, "hub path", 4096)
+    if "`" in relative:
+        raise RmemError("hub paths containing backticks are not supported in instruction blocks")
+    with directory_lock(project), hub_lock(hub):
+        pointer = safe_path(project, ".rmem")
+        agents = safe_path(project, "AGENTS.md")
+        claude = safe_path(project, "CLAUDE.md")
+        if pointer.exists() and pointer_target(pointer) != hub and not a.replace:
+            raise RmemError("project already links to another hub; use --replace for an intentional relink")
+        text = agents.read_text(encoding="utf-8") if agents.exists() else ""
+        ctext = claude.read_text(encoding="utf-8") if claude.exists() else ""
+        span = marker_span(text, "AGENTS.md")
+        marker_span(ctext, "CLAUDE.md")
+        executable = shlex.quote(str(Path(relative) / "bin" / "rmem"))
+        block = (f"{BLOCK_START}\n## Shared research memory (rmem)\n"
+                 f"The memory hub is `{relative}`, relative to this project directory.\n"
+                 f"From this directory, run `{executable} status`, then read `{relative}/AGENTS.md`.\n"
+                 "Use a unique RMEM_SESSION for each working session and follow the shared protocol.\n"
+                 f"Run noisy commands through `{executable} run`; query evidence instead of pasting raw logs.\n{BLOCK_END}\n")
+        updated = text[:span[0]] + block + text[span[1]:] if span else append_block(text, block)
+        if not re.search(r"(?m)^\s*@AGENTS\.md\s*$", ctext):
+            ctext = append_block(ctext, "@AGENTS.md\n\nRead AGENTS.md in this directory for the shared memory protocol.\n")
+        # Validate all three files before the first write. Each replacement is atomic.
+        for path, value in ((agents, updated), (claude, ctext), (pointer, relative + "\n")):
+            if path.exists() and not path.is_file():
+                raise RmemError(f"expected a regular file: {path}")
+        for path, value in ((agents, updated), (claude, ctext), (pointer, relative + "\n")):
+            atomic_write(path, value)
+        append_locked(hub, {**who, "kind": "link", "where": str(project), "replaced": a.replace})
+    print(f"linked {project} → {relative}; record the location in MAP.md")
+    return 0
+
+
+def cmd_init(a):
+    original = Path(a.directory).expanduser()
+    if original.is_symlink():
+        raise RmemError("init destination must not be a symlink")
+    destination = original.resolve()
+    if destination.exists() and (not destination.is_dir() or any(destination.iterdir())):
+        raise RmemError("init destination must be absent or an empty directory")
+    name = one_line(a.project_name or destination.name, "project name", 200)
+    source = Path(__file__).resolve().parent.parent
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=".rmem-init-", dir=destination.parent))
+    try:
+        for directory in ("bin", "threads", "claims", "journal", "findings", "runs"):
+            (staging / directory).mkdir()
+        whitelist = ("README.md", "AGENTS.md", "CLAUDE.md", "BOOTSTRAP.md", "SKILL.md",
+                     "findings/README.md", ".gitattributes", ".gitignore")
+        for item in whitelist:
+            origin = safe_path(source, item)
+            if origin.is_file():
+                shutil.copyfile(origin, staging / item)
+        shutil.copyfile(Path(__file__).resolve(), staging / "bin/rmem")
+        (staging / "bin/rmem").chmod(0o755)
+        (staging / "STATE.md").write_text(f"# STATE — {name}\n<!-- Budget: 120 lines; keep this file concise. -->\n\n## Goal\nNot configured. Define the research question and completion criteria from verified project sources.\n\n## Constraints and operational state\n- Memory initialization does not authorize execution or enable automation.\n- Record canonical controller/owner, host holds, resource limits, and verification time here.\n- Use original experiment IDs; preserve configuration and evidence provenance.\n\n## Thread index\n| slug | status | one-line state and next step | evidence |\n|---|---|---|---|\n\n## Settled decisions\nNo project decisions imported yet.\n\n## Open questions\n- Establish authoritative sources and import coverage before research takeover.\n", encoding="utf-8")
+        (staging / "MAP.md").write_text("# MAP — project locations and source authority\n\n| Location | Role / authority | Availability and observed time | New location after migration |\n|---|---|---|---|\n\n## Rules\n- One canonical writable memory hub; external folders are sources or artifacts.\n- Record source precedence and unresolved contradictions explicitly.\n- Relative locations resolve from this hub unless a row states otherwise.\n- Remote workers return artifacts, not competing writable hubs.\n- Claims and operating permissions are never inherited from another project.\n", encoding="utf-8")
+        (staging / "ledger.jsonl").write_text("", encoding="utf-8")
+        ignore = staging / ".gitignore"
+        rules = ignore.read_text(encoding="utf-8") if ignore.exists() else ""
+        for rule in ("runs/", "claims/", ".rmem.lock", "__pycache__/"):
+            if rule not in rules.splitlines():
+                rules += ("" if not rules or rules.endswith("\n") else "\n") + rule + "\n"
+        ignore.write_text(rules, encoding="utf-8")
+        for directory in ("threads", "journal"):
+            (staging / directory / ".gitkeep").touch()
+        # os.replace rejects a destination that became nonempty during initialization.
+        os.replace(staging, destination)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+    print(f"initialized {destination} (no Git repository or automation was started)")
+    return 0
+
+
+def memory_path(value: str) -> bool:
+    path = Path(value)
+    return (value in ("STATE.md", "MAP.md", "ledger.jsonl") or
+            len(path.parts) >= 2 and path.parts[0] in ("threads", "findings", "journal")
+            and (path.suffix == ".md" or path.name == ".gitkeep"))
+
+
+def cmd_sync(a):
+    hub = find_hub()
+    who = actor(a)
+    with hub_lock(hub):
+        root = run_git(hub, "rev-parse", "--show-toplevel", check=False)
+        if root.returncode or Path(root.stdout.strip()).resolve() != hub:
+            raise RmemError("hub must be its own Git repository; initialize it explicitly first")
+        staged = run_git(hub, "diff", "--cached", "--name-only", "-z").stdout.split("\0")
+        unrelated = [name for name in staged if name and not memory_path(name)]
+        if unrelated:
+            raise RmemError("unrelated staged files would be committed: " + clipped(", ".join(unrelated), 1000))
+        paths = {name for name in run_git(hub, "ls-files", "-z").stdout.split("\0") if name and memory_path(name)}
+        paths.update(name for name in ("STATE.md", "MAP.md", "ledger.jsonl") if safe_path(hub, name).exists())
+        for directory in ("threads", "findings", "journal"):
+            for path in safe_path(hub, directory).rglob("*"):
+                relative = str(path.relative_to(hub))
+                if path.is_symlink():
+                    raise RmemError(f"refusing symlink in memory: {path}")
+                if path.is_file() and memory_path(relative):
+                    paths.add(relative)
+        for name in paths:
+            safe_path(hub, name)
+        if paths:
+            run_git(hub, "add", "-A", "--", *sorted(paths))
+        staged = run_git(hub, "diff", "--cached", "--name-only", "-z").stdout.split("\0")
+        if any(name and not memory_path(name) for name in staged):
+            raise RmemError("staging changed concurrently; refusing to commit unrelated files")
+        pending = run_git(hub, "diff", "--cached", "--quiet", check=False)
+        if pending.returncode == 0:
+            print("no memory changes to commit")
+            return 0
+        if pending.returncode != 1:
+            raise RmemError("git could not inspect the staged memory changes")
+        message = a.message or f"rmem sync by {who['agent']}"
+        one_line(message, "commit message", 1000)
+        run_git(hub, "commit", "-q", "-m", message)
+    print("committed memory files")
+    return 0
+
+
+def add_metadata(parser):
+    parser.add_argument("--job-id")
+    parser.add_argument("--scheduler")
+    parser.add_argument("--host", help="host of the evidence/job; recording host is stored separately")
+    parser.add_argument("--evidence-level", choices=("observed", "reported", "inferred"))
+    parser.add_argument("--artifact", action="append", help="artifact path or host:path pointer; repeatable")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="rmem", description=__doc__)
+    parser.add_argument("--agent", help="descriptive agent label; not an ownership credential")
+    parser.add_argument("--session", help="unique working-session ID (or RMEM_SESSION)")
+    commands = parser.add_subparsers(dest="command", required=True)
+    p = commands.add_parser("init", help="create a new empty, self-contained hub")
+    p.add_argument("directory")
+    p.add_argument("--project-name")
+    p.set_defaults(fn=cmd_init)
+    p = commands.add_parser("status", help="bounded current state, ownership, and recent events")
+    p.add_argument("-n", type=count, default=8)
+    p.add_argument("--thread", type=identifier)
+    p.set_defaults(fn=cmd_status)
+    p = commands.add_parser("recent", help="bounded, streaming ledger query")
+    p.add_argument("-n", type=count, default=20)
+    p.add_argument("--kind")
+    p.add_argument("--thread", type=identifier)
+    p.add_argument("--grep", type=regex)
+    p.set_defaults(fn=cmd_recent)
+    for name, function in (("claim", cmd_claim), ("release", cmd_release)):
+        p = commands.add_parser(name, help=f"{name} a thread for this working session")
+        p.add_argument("slug", type=identifier)
+        p.add_argument("--note")
+        p.add_argument("--force", action="store_true")
+        p.add_argument("--reason")
+        p.set_defaults(fn=function)
+    p = commands.add_parser("log", help="append one evidence-backed event")
+    p.add_argument("--kind", default="exp", choices=("exp", "decision", "finding", "todo", "import"))
+    p.add_argument("--id", type=identifier)
+    p.add_argument("--thread", type=identifier)
+    p.add_argument("--hyp")
+    p.add_argument("--status", choices=("planned", "running", "keep", "discard", "crash", "inconclusive", "cancelled"))
+    p.add_argument("--metric", action="append")
+    p.add_argument("--commit", help="explicit source-code revision; historical imports never infer one")
+    p.add_argument("--where")
+    p.add_argument("--note")
+    p.add_argument("--source", action="append", help="local evidence file to hash; repeatable")
+    p.add_argument("--source-id")
+    p.add_argument("--source-namespace")
+    p.add_argument("--event-time", help="original ISO 8601 event time with timezone; ts remains ingestion time")
+    p.add_argument("--supersedes", help="stable event/source-record pointer corrected by this event")
+    add_metadata(p)
+    p.set_defaults(fn=cmd_log)
+    p = commands.add_parser("note", help="append a note to this session's journal")
+    p.add_argument("text")
+    p.set_defaults(fn=cmd_note)
+    p = commands.add_parser("run", help="capture a command, its starting code state, and a bounded digest")
+    p.add_argument("--id", required=True, type=identifier)
+    p.add_argument("--thread", required=True, type=identifier)
+    p.add_argument("--grep", type=regex, default=r"^(METRIC|val_|test_|eval_|final_)")
+    p.add_argument("--max-lines", type=count, default=20)
+    p.add_argument("--tail", type=count, default=30)
+    add_metadata(p)
+    p.add_argument("cmd", nargs=argparse.REMAINDER)
+    p.set_defaults(fn=cmd_run)
+    p = commands.add_parser("check", help="check caps, claim metadata, and ledger integrity")
+    p.set_defaults(fn=cmd_check)
+    p = commands.add_parser("link", help="atomically link a project while preserving its existing instructions")
+    p.add_argument("project_dir")
+    p.add_argument("--replace", action="store_true", help="explicitly replace a pointer to a different hub")
+    p.set_defaults(fn=cmd_link)
+    p = commands.add_parser("sync", help="commit only memory files; never push")
+    p.add_argument("-m", "--message")
+    p.set_defaults(fn=cmd_sync)
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        return args.fn(args) or 0
+    except (RmemError, OSError, UnicodeError, ValueError) as exc:
+        print("rmem: " + clipped(exc, 1800), file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("rmem: interrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

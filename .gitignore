@@ -1,0 +1,11 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.coverage*
+htmlcov/
+.pytest_cache/
+/reports/
+/.research-memory/
+/.rmem
+/.env
+/.env.*
