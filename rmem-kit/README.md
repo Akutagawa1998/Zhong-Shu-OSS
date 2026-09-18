@@ -132,6 +132,10 @@ Use one writer host for the canonical hub. Remote workers produce artifacts;
 the coordinator imports readouts. Claims use local filesystem locks; Git clones,
 network filesystems, and `merge=union` cannot provide distributed ownership or
 resolve competing conclusions. Claims, locks, and raw runs are ignored by Git.
+After restoring a reviewed snapshot into a new location, the CLI recreates the
+empty ignored `claims/` runtime directory. Missing memory directories still fail
+validation. A restored copy is not a second concurrent authority; link workspaces
+to it only after an intentional handoff.
 Keep artifact backups separately.
 
 ## Checks, history, and limits

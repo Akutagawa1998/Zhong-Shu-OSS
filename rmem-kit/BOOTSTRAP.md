@@ -53,6 +53,8 @@ actions; importing history never starts jobs or enables automation.
    unresolved conflicts, inaccessible artifacts, and execution authorization.
    Save a reviewed Git snapshot. Keep migration acceptance separate from research
    execution acceptance; do not create an extra scheduler heartbeat.
+   Restore that snapshot into a disposable directory and run `status`/`check`;
+   a successful commit or bundle verification alone does not test recovery.
 
 After migration, prefer project-relative artifact paths. Preserve old source
 locations as provenance and map them to new paths in MAP; historical hashes remain

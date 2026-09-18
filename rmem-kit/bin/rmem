@@ -166,9 +166,15 @@ def validate_hub(hub: Path) -> Path:
     for name in ("STATE.md", "ledger.jsonl"):
         if not safe_path(hub, name).is_file():
             raise RmemError(f"not an initialized hub: missing {name} in {hub}")
-    for name in ("threads", "claims", "journal", "findings"):
+    for name in ("threads", "journal", "findings"):
         if not safe_path(hub, name).is_dir():
             raise RmemError(f"not an initialized hub: missing {name}/ in {hub}")
+    # Claims are ignored runtime state, so a valid Git clone has no claims/.
+    # Recreate only this ephemeral directory; never invent missing memory.
+    claims = safe_path(hub, "claims")
+    claims.mkdir(exist_ok=True)
+    if not claims.is_dir():
+        raise RmemError(f"expected a claims directory in {hub}")
     return hub
 
 

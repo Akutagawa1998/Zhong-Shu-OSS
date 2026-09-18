@@ -1,7 +1,7 @@
-# Zhong-Shu v0.2.0
+# Zhong-Shu v0.2.1
 
 This reconstructed development snapshot preserves the reusable kit and its
-tests from the original v0.2.0 milestone. Use the [current release] for new
+tests from the original v0.2.1 milestone. Use the [current release] for new
 installations and security updates.
 
 - [Historical kit documentation](rmem-kit/README.md)

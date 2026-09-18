@@ -81,6 +81,22 @@ class RmemTests(unittest.TestCase):
         empty.mkdir()
         self.call("init", str(empty))
 
+    def test_git_clone_recovers_ignored_claim_directory(self):
+        self.git_init()
+        self.git("add", "--all")
+        self.git("commit", "-qm", "initial reusable hub")
+        restored = self.root / "restored"
+        self.git("clone", "-q", str(self.hub), str(restored), cwd=self.root)
+        self.assertFalse((restored / "claims").exists())
+        restored_env = {**self.env, "RMEM_HUB": str(restored)}
+        self.call("status", env=restored_env, cwd=restored)
+        self.call("claim", "recovered", env=restored_env, cwd=restored)
+        self.call("release", "recovered", env=restored_env, cwd=restored)
+        self.call("check", env=restored_env, cwd=restored)
+        # Missing memory is corruption, not an empty directory to recreate.
+        shutil.rmtree(restored / "threads")
+        self.call("status", env=restored_env, cwd=restored, ok=False)
+
     def test_session_identity_and_force_audit(self):
         no_session = {k: v for k, v in self.env.items() if k != "RMEM_SESSION"}
         self.call("claim", "alpha", env=no_session, ok=False)
