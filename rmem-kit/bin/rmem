@@ -28,6 +28,10 @@ import tempfile
 import time
 import uuid
 
+from research_records import (catalog_view, coverage_view, load_record_file,
+                              show_view, validate_record)
+import research_highlights as highlights
+
 STATE_MAX_LINES = 120
 THREAD_MAX_LINES = 80
 STATE_MAX_CHARS = 8000
@@ -70,6 +74,16 @@ def regex(value: str):
         return re.compile(value)
     except re.error as exc:
         raise argparse.ArgumentTypeError(f"invalid regex: {exc}") from exc
+
+
+def zoned_timestamp(value: str):
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected an ISO 8601 timestamp with a timezone") from exc
+    if parsed.tzinfo is None:
+        raise argparse.ArgumentTypeError("timestamp must include a timezone")
+    return parsed
 
 
 def one_line(value: str, name: str, limit: int = 1000) -> str:
@@ -304,6 +318,20 @@ def event_problem(event) -> str:
         return "event secs must be a nonnegative finite number"
     if "evidence_level" in event and event["evidence_level"] not in ("observed", "reported", "inferred"):
         return "invalid evidence level"
+    if "sequence" in event and (not isinstance(event["sequence"], int) or
+                                 isinstance(event["sequence"], bool) or event["sequence"] < 1):
+        return "event sequence must be a positive integer"
+    if "research" in event:
+        try:
+            problem = validate_record(event["research"])
+        except (ValueError, RecursionError) as exc:
+            return f"invalid research record: {exc}"
+        if problem:
+            return "invalid research record: " + problem
+        if event.get("id") != event["research"].get("experiment_id"):
+            return "event id must match research experiment_id"
+        if not event.get("thread") or not event.get("session"):
+            return "research record requires an event thread and session"
     return ""
 
 
@@ -323,8 +351,20 @@ def events_locked(hub: Path):
 
 
 def append_locked(hub: Path, event: dict) -> dict:
-    event = {"ts": now(), "event_id": uuid.uuid4().hex,
+    # Caller holds the hub lock: assign the next step without rewriting legacy
+    # rows, whose ledger position supplies their historical step number.
+    total, maximum, event_ids = 0, 0, set()
+    for previous in events_locked(hub):
+        total += 1
+        maximum = max(maximum, previous.get("sequence", 0))
+        if previous.get("event_id"):
+            event_ids.add(previous["event_id"])
+    event_id = uuid.uuid4().hex
+    while event_id in event_ids:
+        event_id = uuid.uuid4().hex
+    event = {"ts": now(),
              "host": socket.gethostname(), **event,
+             "event_id": event_id, "sequence": max(total, maximum) + 1,
              "recorded_host": socket.gethostname(), "cwd": str(Path.cwd())}
     problem = event_problem(event)
     if problem:
@@ -555,6 +595,60 @@ def cmd_recent(a):
     return 0
 
 
+def record_view(function, *args):
+    try:
+        return function(*args)
+    except (ValueError, RecursionError) as exc:
+        raise RmemError(str(exc)) from exc
+
+
+def cmd_catalog(a):
+    hub = find_hub()
+    with hub_lock(hub, shared=True):
+        view = record_view(catalog_view, hub, list(events_locked(hub)), a)
+    # Views own their budgets; Output would truncate JSON mid-value.
+    print(json.dumps(view, ensure_ascii=False, separators=(",", ":"), allow_nan=False))
+    return 0
+
+
+def cmd_show(a):
+    hub = find_hub()
+    with hub_lock(hub, shared=True):
+        view = record_view(show_view, hub, list(events_locked(hub)), a.identifier, a.section)
+    print(json.dumps(view, ensure_ascii=False, separators=(",", ":"), allow_nan=False))
+    return 0
+
+
+def cmd_highlight(a):
+    hub = find_hub()
+    creating = a.highlight_command == "create"
+    who = actor(a, required=creating)
+    with hub_lock(hub, shared=not creating):
+        events = list(events_locked(hub))
+        if creating:
+            require_claim(hub, "project-state", who)
+            receipt = highlights.freeze(hub, a.spec, who, events)
+            event = append_locked(hub, {**who, "kind": "highlight_created", "thread": "project-state",
+                                       "id": receipt["id"], "manifest_sha256": receipt["manifest_sha256"],
+                                       "highlight_path": receipt["highlight_path"], "occurred_at": receipt["occurred_at"],
+                                       "captured_at": receipt["captured_at"], "note": receipt["summary"]})
+            result = {**receipt, "event_id": event["event_id"], "sequence": event["sequence"],
+                      "limits": "Snapshot recorded; evidence status is preserved, not upgraded to scientific acceptance."}
+        elif a.highlight_command == "list":
+            if a.since and a.until and a.since > a.until:
+                raise RmemError("--since must not be after --until")
+            result = highlights.list_view(hub, events, a)
+        elif a.highlight_command == "restore":
+            result = highlights.restore(hub, a.identifier, a.destination, events)
+        else:
+            manifest = highlights.verify(hub, a.identifier, events)
+            result = highlights.show_view(manifest, highlights.inventory(hub, events)) if a.highlight_command == "show" else {
+                "highlight_id": a.identifier, "verified": True, "file_count": len(manifest["files"]),
+                "limits": "Local bytes, ledger prefix and anchor verified; no remote availability or scientific acceptance implied."}
+    print(json.dumps(result, ensure_ascii=False, separators=(",", ":"), allow_nan=False))
+    return 0
+
+
 def run_git(path: Path, *args, check: bool = True):
     try:
         result = subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True, timeout=30)
@@ -636,7 +730,7 @@ def parse_metrics(values) -> dict:
 def import_fingerprint(event: dict) -> str:
     fields = ("kind", "id", "thread", "status", "hyp", "metrics", "commit", "where", "note",
               "sources", "source_namespace", "source_id", "job_id", "scheduler", "artifacts", "evidence_level",
-              "event_time", "supersedes", "evidence_host")
+              "event_time", "supersedes", "evidence_host", "research")
     payload = {key: event[key] for key in fields if event.get(key) is not None}
     if "sources" in payload:
         # Locations belong to the preserved receipt, not evidence identity: a
@@ -650,9 +744,26 @@ def import_fingerprint(event: dict) -> str:
 
 
 def cmd_log(a):
+    if a.record and not a.thread:
+        raise RmemError("--record requires --thread and that session's claim")
     hub, who = find_hub(), actor(a, required=bool(a.thread))
-    sources = source_records(a.source)
+    source_paths = list(a.source or [])
+    if a.record:
+        source_paths.append(a.record)
+    sources = source_records(source_paths)
+    research = None
+    if a.record:
+        research = record_view(load_record_file, Path(a.record).expanduser())
+        refreshed = source_records([a.record])[0]
+        original = next(source for source in sources if source["path"] == refreshed["path"])
+        if (original["sha256"], original["bytes"]) != (refreshed["sha256"], refreshed["bytes"]):
+            raise RmemError("research record changed while reading; retry with a stable file")
+        if a.id is not None and a.id != research["experiment_id"]:
+            raise RmemError("--id must match the record's experiment_id")
+        a.id = research["experiment_id"]
     event = {**who, "kind": a.kind, **extra_metadata(a)}
+    if research is not None:
+        event["research"] = research
     for name in ("id", "thread", "status", "hyp", "commit", "where", "note", "supersedes"):
         value = getattr(a, name)
         if value is not None:
@@ -832,33 +943,49 @@ def cmd_check(a):
         out.add("! " + message)
 
     with hub_lock(hub, shared=True):
-        files = [(safe_path(hub, "STATE.md"), STATE_MAX_LINES, STATE_MAX_CHARS)]
-        files += [(p, THREAD_MAX_LINES, THREAD_MAX_CHARS) for p in safe_path(hub, "threads").glob("*.md")]
-        for path, line_cap, char_cap in files:
-            try:
-                safe_path(hub, str(path.relative_to(hub)))
-                nlines = sum(1 for _ in bounded_lines(path))
-                if nlines > line_cap or path.stat().st_size > char_cap:
-                    problem(f"{path.relative_to(hub)} exceeds context cap ({line_cap} lines / {char_cap} bytes)")
-            except RmemError as exc:
-                problem(str(exc))
-        for directory in sorted(safe_path(hub, "claims").iterdir()):
-            if directory.name == ".gitkeep":
-                continue
-            try:
-                identifier(directory.name)
-                meta, error = load_claim(hub, directory.name)
-                if error:
-                    problem(f"claim '{directory.name}': {error}")
-                elif (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(meta["ts"])).total_seconds() > STALE_CLAIM_HOURS * 3600:
-                    problem(f"claim '{directory.name}' is older than {STALE_CLAIM_HOURS}h; check its owner and jobs")
-            except (RmemError, argparse.ArgumentTypeError) as exc:
-                problem(str(exc))
+        if not a.records:
+            files = [(safe_path(hub, "STATE.md"), STATE_MAX_LINES, STATE_MAX_CHARS)]
+            files += [(p, THREAD_MAX_LINES, THREAD_MAX_CHARS) for p in safe_path(hub, "threads").glob("*.md")]
+            for path, line_cap, char_cap in files:
+                try:
+                    safe_path(hub, str(path.relative_to(hub)))
+                    nlines = sum(1 for _ in bounded_lines(path))
+                    if nlines > line_cap or path.stat().st_size > char_cap:
+                        problem(f"{path.relative_to(hub)} exceeds context cap ({line_cap} lines / {char_cap} bytes)")
+                except RmemError as exc:
+                    problem(str(exc))
+            for directory in sorted(safe_path(hub, "claims").iterdir()):
+                if directory.name == ".gitkeep":
+                    continue
+                try:
+                    identifier(directory.name)
+                    meta, error = load_claim(hub, directory.name)
+                    if error:
+                        problem(f"claim '{directory.name}': {error}")
+                    elif (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(meta["ts"])).total_seconds() > STALE_CLAIM_HOURS * 3600:
+                        problem(f"claim '{directory.name}' is older than {STALE_CLAIM_HOURS}h; check its owner and jobs")
+                except (RmemError, argparse.ArgumentTypeError) as exc:
+                    problem(str(exc))
         imports = {}
         active = set()
-        for event in events_locked(hub):
+        event_ids, sequences = set(), set()
+        events = list(events_locked(hub))
+        for event in events:
             if event["kind"] == "CORRUPT":
                 problem("ledger: " + event["note"])
+                continue
+            if event.get("event_id"):
+                if event["event_id"] in event_ids:
+                    problem(f"ledger: duplicate event_id {event['event_id']}")
+                event_ids.add(event["event_id"])
+            if "sequence" in event:
+                if event["sequence"] in sequences:
+                    problem(f"ledger: duplicate stored sequence {event['sequence']}")
+                sequences.add(event["sequence"])
+            if (a.require_records_since is not None and event["kind"] in
+                    ("exp", "finding", "decision", "todo") and "research" not in event and
+                    dt.datetime.fromisoformat(event["ts"]) >= a.require_records_since):
+                problem(f"ledger: {event.get('event_id', event.get('id', '?'))} requires a research record after cutoff")
             if event["kind"] == "import" and event.get("source_id"):
                 key = (event.get("source_namespace"), event["source_id"])
                 fingerprint = import_fingerprint(event)
@@ -871,6 +998,8 @@ def cmd_check(a):
                 active.discard(event.get("run_id"))
         if active:
             out.add(f"info: {len(active)} unfinished run(s); may still be running, inspect before recovery")
+        coverage = record_view(coverage_view, hub, events)
+        out.add("records: " + json.dumps(coverage, ensure_ascii=False, separators=(",", ":"), allow_nan=False))
     if not failures:
         out.add("ok")
     out.emit()
@@ -918,6 +1047,8 @@ def cmd_link(a):
                  f"The memory hub is `{relative}`, relative to this project directory.\n"
                  f"From this directory, run `{executable} status`, then read `{relative}/AGENTS.md`.\n"
                  "Use a unique RMEM_SESSION for each working session and follow the shared protocol.\n"
+                 f"Use `{executable} catalog --query TOPIC` then `show EXACT_ID`; read only the relevant thread and cited evidence.\n"
+                 "Keep one canonical writable hub; a code worktree or remote worker is not a second memory authority.\n"
                  f"Run noisy commands through `{executable} run`; query evidence instead of pasting raw logs.\n{BLOCK_END}\n")
         updated = text[:span[0]] + block + text[span[1]:] if span else append_block(text, block)
         if not re.search(r"(?m)^\s*@AGENTS\.md\s*$", ctext):
@@ -948,12 +1079,16 @@ def cmd_init(a):
         for directory in ("bin", "threads", "claims", "journal", "findings", "runs"):
             (staging / directory).mkdir()
         whitelist = ("README.md", "AGENTS.md", "CLAUDE.md", "BOOTSTRAP.md", "SKILL.md",
-                     "findings/README.md", ".gitattributes", ".gitignore")
+                     "findings/README.md", "RECORDS.md", "RECORD_TEMPLATE.json", "HIGHLIGHTS.md",
+                     "HIGHLIGHT_TEMPLATE.json", ".gitattributes", ".gitignore")
         for item in whitelist:
             origin = safe_path(source, item)
             if origin.is_file():
                 shutil.copyfile(origin, staging / item)
         shutil.copyfile(Path(__file__).resolve(), staging / "bin/rmem")
+        shutil.copyfile(safe_path(source, "bin", "research_records.py"), staging / "bin/research_records.py")
+        for helper in ("research_highlights.py", "artifact_routes.py"):
+            shutil.copyfile(safe_path(source, "bin", helper), staging / "bin" / helper)
         (staging / "bin/rmem").chmod(0o755)
         (staging / "STATE.md").write_text(f"# STATE — {name}\n<!-- Budget: 120 lines; keep this file concise. -->\n\n## Goal\nNot configured. Define the research question and completion criteria from verified project sources.\n\n## Constraints and operational state\n- Memory initialization does not authorize execution or enable automation.\n- Record canonical controller/owner, host holds, resource limits, and verification time here.\n- Use original experiment IDs; preserve configuration and evidence provenance.\n\n## Thread index\n| slug | status | one-line state and next step | evidence |\n|---|---|---|---|\n\n## Settled decisions\nNo project decisions imported yet.\n\n## Open questions\n- Establish authoritative sources and import coverage before research takeover.\n", encoding="utf-8")
         (staging / "MAP.md").write_text("# MAP — project locations and source authority\n\n| Location | Role / authority | Availability and observed time | New location after migration |\n|---|---|---|---|\n\n## Rules\n- One canonical writable memory hub; external folders are sources or artifacts.\n- Record source precedence and unresolved contradictions explicitly.\n- Relative locations resolve from this hub unless a row states otherwise.\n- Remote workers return artifacts, not competing writable hubs.\n- Claims and operating permissions are never inherited from another project.\n", encoding="utf-8")
@@ -1049,6 +1184,34 @@ def build_parser():
     p.add_argument("--thread", type=identifier)
     p.add_argument("--grep", type=regex)
     p.set_defaults(fn=cmd_recent)
+    p = commands.add_parser("catalog", help="bounded research-record index; literal query, no whole-repository search")
+    p.add_argument("-n", type=count, default=10)
+    p.add_argument("--query", help="literal case-insensitive text query")
+    p.add_argument("--thread", type=identifier)
+    p.add_argument("--updates", action="store_true", help="show individual updates instead of latest per experiment")
+    p.set_defaults(fn=cmd_catalog)
+    p = commands.add_parser("show", help="bounded research record and exact evidence pointers")
+    p.add_argument("identifier", help="exact experiment ID or event UUID")
+    p.add_argument("--section", choices=("all", "record", "sources", "history"), default="all")
+    p.set_defaults(fn=cmd_show)
+    p = commands.add_parser("highlight", help="immutable milestone/version/finding/correction snapshots")
+    highlight_commands = p.add_subparsers(dest="highlight_command", required=True)
+    h = highlight_commands.add_parser("create", help="copy selected small repository files; requires project-state claim")
+    h.add_argument("spec", help="JSON specification following HIGHLIGHT_TEMPLATE.json")
+    h.set_defaults(fn=cmd_highlight)
+    h = highlight_commands.add_parser("list", help="bounded time or literal-text lookup")
+    h.add_argument("-n", type=count, default=10)
+    h.add_argument("--query")
+    h.add_argument("--time-field", choices=("occurred_at", "captured_at"), default="occurred_at")
+    h.add_argument("--since", type=zoned_timestamp)
+    h.add_argument("--until", type=zoned_timestamp, help="inclusive cutoff; -n 1 selects latest highlight at/before it")
+    h.set_defaults(fn=cmd_highlight)
+    for name in ("show", "verify", "restore"):
+        h = highlight_commands.add_parser(name)
+        h.add_argument("identifier", help="exact hl-UUID highlight identity")
+        if name == "restore":
+            h.add_argument("--destination", required=True, help="new or empty directory outside live repository and control directories")
+        h.set_defaults(fn=cmd_highlight)
     for name, function in (("claim", cmd_claim), ("release", cmd_release)):
         p = commands.add_parser(name, help=f"{name} a thread for this working session")
         p.add_argument("slug", type=identifier)
@@ -1067,6 +1230,7 @@ def build_parser():
     p.add_argument("--where")
     p.add_argument("--note")
     p.add_argument("--source", action="append", help="local evidence file to hash; repeatable")
+    p.add_argument("--record", help="validated structured research record JSON; requires a thread claim")
     p.add_argument("--source-id")
     p.add_argument("--source-namespace")
     p.add_argument("--event-time", help="original ISO 8601 event time with timezone; ts remains ingestion time")
@@ -1086,6 +1250,9 @@ def build_parser():
     p.add_argument("cmd", nargs=argparse.REMAINDER)
     p.set_defaults(fn=cmd_run)
     p = commands.add_parser("check", help="check caps, claim metadata, and ledger integrity")
+    p.add_argument("--records", action="store_true", help="only ledger/record integrity and structured-record coverage")
+    p.add_argument("--require-records-since", type=zoned_timestamp,
+                   help="require records on semantic events ingested at or after this zoned ISO timestamp")
     p.set_defaults(fn=cmd_check)
     p = commands.add_parser("link", help="atomically link a project while preserving its existing instructions")
     p.add_argument("project_dir")

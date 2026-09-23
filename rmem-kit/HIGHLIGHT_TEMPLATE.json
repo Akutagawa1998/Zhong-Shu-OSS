@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "kind": "milestone",
+  "title": "Describe the exact milestone or version",
+  "occurred_at": "2026-09-22T00:00:00+00:00",
+  "summary": "What changed at this point, including exact experiment/version identity.",
+  "significance": "Why this update matters and what it permits us to conclude.",
+  "evidence_status": "reported",
+  "caveats": [
+    "A snapshot preserves recorded evidence; it is not new scientific verification."
+  ],
+  "event_ids": [],
+  "experiment_ids": [],
+  "supersedes": [],
+  "files": [
+    "REPLACE-WITH-REVIEWED-RELATIVE-FILE.md"
+  ],
+  "remote_artifacts": [],
+  "content_reviewed_no_secrets": false
+}

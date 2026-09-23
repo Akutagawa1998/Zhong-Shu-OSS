@@ -92,6 +92,19 @@ Full logs stay in `runs/`; the CLI digests them incrementally after a foreground
 command exits. A successful exit records execution success, not research validity.
 Use `recent --thread baseline --grep 'E042' -n 5` for relevant events.
 
+Use `catalog --query E042 -n 5` to find bounded experiment metadata, then
+`show E042 --section record` or `--section sources` for its exact recipe, progress,
+findings, and artifact pointers. Queries do not scan repository contents or remote
+hosts. The latest correction stays visible when a query matched an earlier claim.
+
+For new research updates, fill [RECORD_TEMPLATE.json](RECORD_TEMPLATE.json) and
+use `log --thread baseline --record /path/to/record.json` under the held claim.
+UUID and append sequence identify updates; `steps` records optimizer updates,
+evaluation calls, or checks. Unknown fields stay `null` with explicit `gaps`.
+See [RECORDS.md](RECORDS.md) for the schema, source locations, reviewed historical
+cards, and optional `check --records --require-records-since TIMESTAMP` enforcement.
+No existing project history is assumed to be complete or automatically migrated.
+
 Runs record the full starting Git commit and whether the worktree was dirty.
 This is not a snapshot of uncommitted code: commit or freeze the actual code and
 configuration before a reproducibility-sensitive run, and cite those files with
@@ -137,6 +150,16 @@ empty ignored `claims/` runtime directory. Missing memory directories still fail
 validation. A restored copy is not a second concurrent authority; link workspaces
 to it only after an intentional handoff.
 Keep artifact backups separately.
+
+## Milestone and version highlights
+
+Use [HIGHLIGHTS.md](HIGHLIGHTS.md) and `HIGHLIGHT_TEMPLATE.json` to freeze selected
+small, reviewed text files with their exact hashes and ledger cutoff under a
+`project-state` claim. `highlight list` supports time/text lookup, `show` preserves
+later correction links, and `verify` checks bytes and the ledger anchor.
+`highlight restore` writes only a separate historical review directory; it never
+rolls back the live hub or operational permissions. Capture requires a Git commit
+and explicit review for secret material. No remote artifact is fetched or backed up.
 
 ## Checks, history, and limits
 

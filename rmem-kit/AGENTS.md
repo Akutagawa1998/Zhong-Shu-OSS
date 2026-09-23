@@ -13,12 +13,16 @@ with source citations and an explicit correction; never silently prefer whicheve
 document was read last. A memory import cannot authorize work or enable a mode.
 
 1. Run this hub's `bin/rmem status`. After compaction, recover the same way.
-2. Reuse a stable unique `--session` (or `RMEM_SESSION`) for this conversation;
+2. Use `catalog --query TOPIC` and `show EXPERIMENT_ID` for bounded task recovery;
+   read only the selected thread, structured record, and cited evidence. Honor any
+   explicitly registered active-context/archive map. No result means a record gap,
+   not permission to load the entire repository. See [RECORDS.md](RECORDS.md).
+3. Reuse a stable unique `--session` (or `RMEM_SESSION`) for this conversation;
    set `--agent` for attribution. Do not share a session ID with another agent.
-3. For thread work, `rmem claim <slug>` with that session; read only its
+4. For thread work, `rmem claim <slug>` with that session; read only its
    `threads/<slug>.md` and cited evidence. Read-only inspection needs no claim.
    Planning that changes a thread needs a claim, just like execution.
-4. Check project authorization and running-job state before executing the next
+5. Check project authorization and running-job state before executing the next
    step. The hub records intended actions, not live scheduler truth.
 
 ## While working
@@ -26,6 +30,11 @@ document was read last. A memory import cannot authorize work or enable a mode.
 - Capture noisy foreground commands with `rmem run --id <original-id> --thread
   <slug> -- <command>`. Raw output stays on disk. For long/remote jobs, use the
   project scheduler and record job/host/artifact pointers via `rmem log`.
+- New training/inference/result updates should use `rmem log --record FILE` with
+  exact task, lineage, data, recipe, progress, findings, and artifact locations.
+  Keep unknowns explicit. UUID/append sequence are not optimizer steps; a remote
+  URI is not a verified backup. Reviewed `records/` cards require `project-state`.
+  Legacy logging remains compatible; `check --records` reports its coverage gaps.
 - Record a scientific interpretation separately from process completion:
   `rmem log --id <id> --thread <slug> --status keep|discard|crash|inconclusive
   --metric name=value --hyp '...' --note '...'`. Match metrics to dataset, split,
@@ -40,6 +49,12 @@ document was read last. A memory import cannot authorize work or enable a mode.
   `recent --thread <slug> --grep <pattern>` instead of loading the ledger.
   Retrieve only bounded raw-log slices needed to answer a particular question.
 - Scratch notes go to `rmem note`; they are not loaded automatically on recovery.
+- For a meaningful milestone, version, finding, or correction, use the reviewed
+  `highlight create SPEC` workflow under `project-state`; see [HIGHLIGHTS.md](HIGHLIGHTS.md).
+  Capture only selected small non-secret text files. Keep occurred/captured time
+  and evidence status separate; follow superseding highlights even in old-time views.
+  Restore only to a separate review directory, never into the live repository or
+  operating controller. A snapshot grants no execution or publishing authority.
 
 ## Concurrent writers
 
@@ -47,7 +62,7 @@ document was read last. A memory import cannot authorize work or enable a mode.
 |---|---|
 | `ledger.jsonl` | CLI append only; thread events require that thread's claim |
 | `threads/<slug>.md` | that thread's session claim |
-| `STATE.md`, `MAP.md`, `findings/`, global decisions | `project-state` claim |
+| `STATE.md`, `MAP.md`, `findings/`, `records/`, `highlights/`, global decisions | `project-state` claim |
 | `journal/` | use `rmem note` with your session identity |
 
 For a shared-document edit, take `project-state`, re-read the current file, make a
