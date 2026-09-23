@@ -7,8 +7,10 @@ proof of scientific success. Historical ledger entries remain immutable.
 ## Recover a task without scanning the repository
 
 1. Read the linked hub's `AGENTS.md`; run `bin/rmem status`.
-2. Read the relevant `threads/<slug>.md` and query the small event/card index.
-3. Retrieve the exact experiment or event and only its cited evidence slices.
+2. Query the project metadata index, then read the relevant short
+   `threads/<slug>.md`; see [INDEXED_READING.md](INDEXED_READING.md).
+3. Use `catalog` / `show` to retrieve the exact experiment or event, then only
+   its cited evidence slices.
 4. If fields or artifacts are missing, report the gap and follow explicit source
    mappings. An empty query result does not justify loading the whole repository.
 

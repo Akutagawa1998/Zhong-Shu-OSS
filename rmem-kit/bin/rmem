@@ -31,6 +31,7 @@ import uuid
 from research_records import (catalog_view, coverage_view, load_record_file,
                               show_view, validate_record)
 import research_highlights as highlights
+from research_consistency import claim_issues, ownership_history
 
 STATE_MAX_LINES = 120
 THREAD_MAX_LINES = 80
@@ -424,12 +425,53 @@ def load_claim(hub: Path, slug: str):
 
 
 def require_claim(hub: Path, slug: str, who: dict):
+    consistency_preflight(hub)
     meta, problem = load_claim(hub, slug)
     if problem:
         raise RmemError(f"thread '{slug}': {problem}; claim it before writing or running")
-    if meta["session"] != who["session"]:
+    if (meta["session"], meta["agent"]) != (who["session"], who["agent"]):
         raise RmemError(f"thread '{slug}' belongs to session {clipped(meta['session'])}, not this session")
     return meta
+
+
+def consistency_snapshot(hub: Path, events=None):
+    events = list(events_locked(hub)) if events is None else events
+    disk = {}
+    for directory in safe_path(hub, "claims").iterdir():
+        if directory.name == ".gitkeep":
+            continue
+        try:
+            identifier(directory.name)
+            metadata, problem = load_claim(hub, directory.name)
+        except (RmemError, argparse.ArgumentTypeError) as error:
+            metadata, problem = None, str(error)
+        disk[directory.name] = {"metadata": metadata, "problem": problem}
+    return claim_issues(events, disk), ownership_history(events)
+
+
+def consistency_preflight(hub: Path, recovery=False):
+    """Caller holds hub lock. Force recovery only bypasses claim mismatches."""
+    events = list(events_locked(hub))
+    identities = set()
+    for event in events:
+        if event["kind"] == "CORRUPT":
+            raise RmemError("ledger is corrupt; run check and recover history before mutation")
+        if event.get("event_id"):
+            if event["event_id"] in identities:
+                raise RmemError("duplicate ledger event_id; run check before mutation")
+            identities.add(event["event_id"])
+    issues, states = consistency_snapshot(hub, events)
+    if issues and not recovery:
+        first = issues[0]
+        raise RmemError(f"claim/ledger inconsistency on '{first['thread']}': {'; '.join(first['problems'])}; "
+                        "run check, inspect owner/jobs and intended Git history; deliberate recovery uses claim/release --force --reason")
+    return issues, states
+
+
+def recovery_metadata(issues, states, slug):
+    previous = states.get(slug, {}).get("active_claim")
+    return {"issue_count": len(issues), "issues": issues[:20],
+            "ledger_previous_claim": {key: previous.get(key) for key in ("event_id", "session", "agent", "ts")} if previous else None}
 
 
 def force_reason(a):
@@ -478,10 +520,11 @@ def cmd_claim(a):
     if a.note is not None:
         one_line(a.note, "note")
     with hub_lock(hub):
+        issues, states = consistency_preflight(hub, recovery=a.force)
         directory = safe_path(hub, "claims", a.slug)
         previous, problem = load_claim(hub, a.slug)
         if previous is not None or directory.exists():
-            if not problem and previous["session"] == who["session"] and not a.force:
+            if not problem and (previous["session"], previous["agent"]) == (who["session"], who["agent"]) and not a.force:
                 print(f"already held by this session: {a.slug}")
                 return 0
             if not a.force:
@@ -491,12 +534,14 @@ def cmd_claim(a):
             directory.mkdir()
         if not thread.exists():
             atomic_write(thread, THREAD_TEMPLATE.format(slug=a.slug))
-        metadata = {**who, "ts": now(), "host": socket.gethostname(), "pid": os.getpid(), "note": a.note or ""}
-        atomic_write(safe_path(hub, "claims", a.slug, "meta.json"), json.dumps(metadata, ensure_ascii=False) + "\n")
-        event = {**who, "kind": "claim", "thread": a.slug, "note": a.note}
+        event = {**who, "kind": "claim", "thread": a.slug, "note": a.note, "claim_metadata_version": 1}
         if a.force:
-            event.update(previous_owner=previous, previous_owner_problem=problem, reason=a.reason)
-        append_locked(hub, event)
+            event.update(previous_owner=previous, previous_owner_problem=problem, reason=a.reason,
+                         consistency_recovery=recovery_metadata(issues, states, a.slug))
+        recorded = append_locked(hub, event)
+        metadata = {**who, "ts": recorded["ts"], "host": socket.gethostname(), "pid": os.getpid(),
+                    "note": a.note or "", "claim_event_id": recorded["event_id"]}
+        atomic_write(safe_path(hub, "claims", a.slug, "meta.json"), json.dumps(metadata, ensure_ascii=False) + "\n")
     print(f"claimed {a.slug} for session {who['session']} → {thread}")
     return 0
 
@@ -507,24 +552,28 @@ def cmd_release(a):
     if a.note is not None:
         one_line(a.note, "note")
     with hub_lock(hub):
+        issues, states = consistency_preflight(hub, recovery=a.force)
         directory = safe_path(hub, "claims", a.slug)
-        if not directory.is_dir():
+        missing = not directory.exists()
+        if not directory.is_dir() and not (missing and a.force and states.get(a.slug, {}).get("active_claim")):
             raise RmemError(f"no claim on '{a.slug}'")
         previous, problem = load_claim(hub, a.slug)
         if not a.force:
             require_claim(hub, a.slug, who)
             if active_runs(hub, a.slug):
                 raise RmemError("thread has an unfinished run; keep the claim, or use explicit recovery after checking the process")
-        unexpected = [p.name for p in directory.iterdir() if p.name != "meta.json"]
+        unexpected = [p.name for p in directory.iterdir() if p.name != "meta.json"] if not missing else []
         if unexpected:
             raise RmemError(f"refusing to delete unexpected claim contents: {clipped(unexpected)}")
         meta = safe_path(hub, "claims", a.slug, "meta.json")
-        meta.unlink(missing_ok=True)
-        directory.rmdir()
         event = {**who, "kind": "release", "thread": a.slug, "note": a.note}
         if a.force:
-            event.update(previous_owner=previous, previous_owner_problem=problem, reason=a.reason)
+            event.update(previous_owner=previous, previous_owner_problem=problem, reason=a.reason,
+                         consistency_recovery=recovery_metadata(issues, states, a.slug))
         append_locked(hub, event)
+        meta.unlink(missing_ok=True)
+        if not missing:
+            directory.rmdir()
     print(f"released {a.slug}")
     return 0
 
@@ -534,6 +583,12 @@ def cmd_status(a):
     out = Output()
     with hub_lock(hub, shared=True):
         out.add(f"# rmem hub: {hub}\n")
+        issues, _ = consistency_snapshot(hub)
+        if issues:
+            out.add("## Claim/ledger inconsistency — ordinary mutations are blocked")
+            for issue in issues[:8]:
+                out.add(f"- {clipped(issue['thread'], 80)}: {clipped('; '.join(issue['problems']), 600)}")
+            out.add("Inspect check/owner/jobs and intended Git history before explicit recovery.\n")
         out.add(text_excerpt(safe_path(hub, "STATE.md"), STATE_MAX_LINES, STATE_MAX_CHARS))
         out.add("\n## Threads")
         threads = sorted(safe_path(hub, "threads").glob("*.md"))
@@ -644,7 +699,8 @@ def cmd_highlight(a):
             manifest = highlights.verify(hub, a.identifier, events)
             result = highlights.show_view(manifest, highlights.inventory(hub, events)) if a.highlight_command == "show" else {
                 "highlight_id": a.identifier, "verified": True, "file_count": len(manifest["files"]),
-                "limits": "Local bytes, ledger prefix and anchor verified; no remote availability or scientific acceptance implied."}
+                "history_verification": manifest.get("history_verification"),
+                "limits": "Frozen local bytes and anchor verified; inspect history_verification for the live-history relation. No remote availability or scientific acceptance implied."}
     print(json.dumps(result, ensure_ascii=False, separators=(",", ":"), allow_nan=False))
     return 0
 
@@ -795,6 +851,7 @@ def cmd_log(a):
         if code.get("commit"):
             event.update(commit=code["commit"], dirty=code["dirty"])
     with hub_lock(hub):
+        consistency_preflight(hub)
         if a.thread:
             require_claim(hub, a.thread, who)
         if a.kind == "import":
@@ -818,6 +875,7 @@ def cmd_note(a):
     one_line(a.text, "note", 4000)
     name = f"{dt.date.today().isoformat()}-{who['agent']}-{who['session']}.md"
     with hub_lock(hub):
+        consistency_preflight(hub)
         path = safe_path(hub, "journal", name)
         with open_regular(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, "a") as stream:
             stream.write(f"- {now()} {a.text}\n")
@@ -907,7 +965,12 @@ def cmd_run(a):
                 if interrupted[0] is not None:
                     final["signal"] = interrupted[0]
                 with hub_lock(hub):
-                    append_locked(hub, final)
+                    try:
+                        consistency_preflight(hub)
+                        append_locked(hub, final)
+                    except RmemError as error:
+                        raise RmemError(f"terminal run event not appended; preserve {relative_log} "
+                                        f"(run_id={run_id}) for reconciliation: {error}") from error
         finally:
             for sig, handler in previous_handlers.items():
                 signal.signal(sig, handler)
@@ -970,6 +1033,9 @@ def cmd_check(a):
         active = set()
         event_ids, sequences = set(), set()
         events = list(events_locked(hub))
+        issues, _ = consistency_snapshot(hub, events)
+        for issue in issues:
+            problem(f"claim/ledger '{issue['thread']}': {'; '.join(issue['problems'])}")
         for event in events:
             if event["kind"] == "CORRUPT":
                 problem("ledger: " + event["note"])
@@ -1033,6 +1099,7 @@ def cmd_link(a):
     if "`" in relative:
         raise RmemError("hub paths containing backticks are not supported in instruction blocks")
     with directory_lock(project), hub_lock(hub):
+        consistency_preflight(hub)
         pointer = safe_path(project, ".rmem")
         agents = safe_path(project, "AGENTS.md")
         claude = safe_path(project, "CLAUDE.md")
@@ -1047,7 +1114,8 @@ def cmd_link(a):
                  f"The memory hub is `{relative}`, relative to this project directory.\n"
                  f"From this directory, run `{executable} status`, then read `{relative}/AGENTS.md`.\n"
                  "Use a unique RMEM_SESSION for each working session and follow the shared protocol.\n"
-                 f"Use `{executable} catalog --query TOPIC` then `show EXACT_ID`; read only the relevant thread and cited evidence.\n"
+                 "Use the project's metadata index to select the relevant short thread first.\n"
+                 f"Then use `{executable} catalog --query TOPIC` and `show EXACT_ID` before opening exact cited evidence.\n"
                  "Keep one canonical writable hub; a code worktree or remote worker is not a second memory authority.\n"
                  f"Run noisy commands through `{executable} run`; query evidence instead of pasting raw logs.\n{BLOCK_END}\n")
         updated = text[:span[0]] + block + text[span[1]:] if span else append_block(text, block)
@@ -1080,14 +1148,15 @@ def cmd_init(a):
             (staging / directory).mkdir()
         whitelist = ("README.md", "AGENTS.md", "CLAUDE.md", "BOOTSTRAP.md", "SKILL.md",
                      "findings/README.md", "RECORDS.md", "RECORD_TEMPLATE.json", "HIGHLIGHTS.md",
-                     "HIGHLIGHT_TEMPLATE.json", ".gitattributes", ".gitignore")
+                     "HIGHLIGHT_TEMPLATE.json", "CONSISTENCY.md", "INDEXED_READING.md",
+                     "CONTEXT_INDEX_TEMPLATE.json", ".gitattributes", ".gitignore")
         for item in whitelist:
             origin = safe_path(source, item)
             if origin.is_file():
                 shutil.copyfile(origin, staging / item)
         shutil.copyfile(Path(__file__).resolve(), staging / "bin/rmem")
         shutil.copyfile(safe_path(source, "bin", "research_records.py"), staging / "bin/research_records.py")
-        for helper in ("research_highlights.py", "artifact_routes.py"):
+        for helper in ("research_highlights.py", "artifact_routes.py", "research_consistency.py", "context_reader.py"):
             shutil.copyfile(safe_path(source, "bin", helper), staging / "bin" / helper)
         (staging / "bin/rmem").chmod(0o755)
         (staging / "STATE.md").write_text(f"# STATE — {name}\n<!-- Budget: 120 lines; keep this file concise. -->\n\n## Goal\nNot configured. Define the research question and completion criteria from verified project sources.\n\n## Constraints and operational state\n- Memory initialization does not authorize execution or enable automation.\n- Record canonical controller/owner, host holds, resource limits, and verification time here.\n- Use original experiment IDs; preserve configuration and evidence provenance.\n\n## Thread index\n| slug | status | one-line state and next step | evidence |\n|---|---|---|---|\n\n## Settled decisions\nNo project decisions imported yet.\n\n## Open questions\n- Establish authoritative sources and import coverage before research takeover.\n", encoding="utf-8")
@@ -1121,6 +1190,7 @@ def cmd_sync(a):
     hub = find_hub()
     who = actor(a)
     with hub_lock(hub):
+        consistency_preflight(hub)
         root = run_git(hub, "rev-parse", "--show-toplevel", check=False)
         if root.returncode or Path(root.stdout.strip()).resolve() != hub:
             raise RmemError("hub must be its own Git repository; initialize it explicitly first")
@@ -1191,7 +1261,7 @@ def build_parser():
     p.add_argument("--updates", action="store_true", help="show individual updates instead of latest per experiment")
     p.set_defaults(fn=cmd_catalog)
     p = commands.add_parser("show", help="bounded research record and exact evidence pointers")
-    p.add_argument("identifier", help="exact experiment ID or event UUID")
+    p.add_argument("identifier", help="exact experiment ID, event UUID, or unambiguous historical import source ID")
     p.add_argument("--section", choices=("all", "record", "sources", "history"), default="all")
     p.set_defaults(fn=cmd_show)
     p = commands.add_parser("highlight", help="immutable milestone/version/finding/correction snapshots")

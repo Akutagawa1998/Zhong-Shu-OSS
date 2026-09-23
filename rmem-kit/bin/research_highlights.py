@@ -256,6 +256,65 @@ def freeze(hub, spec_file, who, events):
             shutil.rmtree(staging)
 
 
+def history_relationship(frozen, live, identity, manifest_hash):
+    """Require unchanged prefix or byte-identical UUID ordered subsequence."""
+    def rows(data):
+        result = []
+        for line in data.splitlines(keepends=True):
+            if line.strip():
+                event = parse_json(line)
+                need(isinstance(event, dict), "live ledger prefix verification requires JSON event objects")
+                result.append((line, event))
+            else:
+                result.append((line, None))
+        return result
+
+    old, current = rows(frozen), rows(live)
+    by_id = {}
+    for index, (line, event) in enumerate(current):
+        event_id = event.get("event_id") if event else None
+        if event_id:
+            need(isinstance(event_id, str) and event_id not in by_id, "live ledger prefix verification rejects duplicate event UUIDs")
+            by_id[event_id] = (index, line, event)
+    old_ids = [event.get("event_id") for _, event in old if event and event.get("event_id")]
+    need(len(set(old_ids)) == len(old_ids), "frozen ledger prefix contains duplicate event UUIDs")
+    anchors = [event for _, event in current if event and event.get("kind") == "highlight_created" and event.get("id") == identity]
+    need(len(anchors) == 1 and anchors[0].get("manifest_sha256") == manifest_hash,
+         "live ledger lacks a unique matching highlight anchor")
+    count = sum(event is not None for _, event in old)
+    if live[:len(frozen)] == frozen:
+        return {"relation": "exact_prefix", "captured_event_count": count,
+                "inserted_event_count": 0, "original_relative_order_preserved": True, "warning": None}
+    positions = []
+    for line, event in old:
+        need(event is not None and isinstance(event.get("event_id"), str),
+             "live ledger prefix differs and frozen row has no stable event UUID")
+        event_id = event["event_id"]
+        try:
+            uuid.UUID(event_id)
+        except (ValueError, AttributeError) as error:
+            raise ValueError("live ledger prefix differs and frozen event ID is not a UUID") from error
+        need(event_id in by_id, "live ledger prefix differs: captured event is missing")
+        position, current_line, _ = by_id[event_id]
+        need(current_line == line, "live ledger prefix differs: captured event JSON line bytes changed")
+        positions.append(position)
+    need(all(left < right for left, right in zip(positions, positions[1:])),
+         "live ledger prefix differs: captured events were reordered")
+    end = positions[-1] + 1 if positions else 0
+    captured_positions = set(positions)
+    for index, (_, event) in enumerate(current[:end]):
+        if index not in captured_positions:
+            need(event is not None and isinstance(event.get("event_id"), str),
+                 "live ledger prefix differs: inserted row lacks an independent event UUID")
+            try:
+                uuid.UUID(event["event_id"])
+            except (ValueError, AttributeError) as error:
+                raise ValueError("live ledger prefix differs: inserted event ID is not a UUID") from error
+    return {"relation": "captured_events_preserved_with_insertions", "captured_event_count": count,
+            "inserted_event_count": end - len(old), "original_relative_order_preserved": True,
+            "warning": "Live history contains inserted events; the frozen history is an ordered subsequence, not the current continuous prefix. Original bytes and order are preserved. This validates historical evidence, not current ownership, authorization or scientific acceptance."}
+
+
 def verify(hub, identity, events):
     directory = highlight_directory(hub, identity)
     encoded = regular_bytes(safe_path(directory, "MANIFEST.json"), MANIFEST_LIMIT)
@@ -287,10 +346,11 @@ def verify(hub, identity, events):
     ledger = regular_bytes(safe_path(directory, prefix["path"]), LEDGER_LIMIT)
     need(len(ledger) == prefix["bytes"] and digest(ledger) == prefix["sha256"], "frozen ledger prefix hash mismatch")
     safe_text(ledger)
-    # The anchored snapshot remains valid after later appends, not after history rewriting.
-    with open(hub / "ledger.jsonl", "rb") as stream:
-        current_prefix = stream.read(len(ledger))
-    need(current_prefix == ledger, "live ledger prefix differs from capture; do not silently restore rewritten history")
+    # Read a stable live snapshot, checking exact event bytes rather than
+    # reserializing JSON. Git reconciliation may insert independent new events.
+    live_path = safe_path(hub, "ledger.jsonl")
+    live = regular_bytes(live_path, live_path.stat().st_size)
+    relation = history_relationship(ledger, live, identity, expected)
     actual = set()
     for path in directory.rglob("*"):
         need(not path.is_symlink(), "snapshot tree contains symlink")
@@ -299,6 +359,8 @@ def verify(hub, identity, events):
         else:
             need(path.is_dir(), "snapshot tree contains special file")
     need(actual == wanted, "snapshot contains missing or unexpected files")
+    # Computed verification metadata is never written into the frozen manifest.
+    manifest["history_verification"] = relation
     return manifest
 
 
@@ -308,6 +370,7 @@ def present(manifest):
             "occurred_at": spec["occurred_at"], "captured_at": manifest["captured_at"],
             "summary": spec["summary"], "evidence_status": spec["evidence_status"],
             "event_ids": spec["event_ids"], "experiment_ids": spec["experiment_ids"], "supersedes": spec["supersedes"],
+            "history_verification": manifest["history_verification"],
             "file_count": len(manifest["files"]), "manifest": "highlights/" + manifest["highlight_id"] + "/MANIFEST.json"}
 
 
@@ -411,4 +474,5 @@ def restore(hub, identity, destination, events):
         if staging.exists():
             shutil.rmtree(staging)
     return {"highlight_id": identity, "destination": str(destination), "restored_files": len(manifest["files"]),
+            "history_verification": manifest["history_verification"],
             "execution_authorized": False, "live_state_changed": False}

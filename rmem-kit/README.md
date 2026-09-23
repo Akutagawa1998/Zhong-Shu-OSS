@@ -63,7 +63,8 @@ must initialize a project hub rather than accumulate live state in itself.
 
 Use one unique session value for the entire conversation. Reuse it in every tool
 call; shell exports may not persist between agent tool invocations. `--agent`
-describes the tool; it is not the lock identity. Global options precede the command.
+describes the tool and is checked alongside the session when validating ownership;
+neither is an authentication credential. Global options precede the command.
 
 ```bash
 python3 .research-memory/bin/rmem status
@@ -85,6 +86,12 @@ dead ends, and a concrete next step. Shared documents require the `project-state
 claim; see [the protocol](AGENTS.md). Stale claims are never automatically stolen.
 Inspect owner and jobs first; explicit recovery uses `--force --reason '...'`.
 
+Claim files are ignored by Git but ownership events are tracked. Ordinary writes
+now compare both before proceeding, and new claim metadata carries its exact event
+UUID. After stash/checkout/restore, inspect any `status`/`check` mismatch and the
+intended history; do not assume an existing claim file is a valid grant. Follow
+[CONSISTENCY.md](CONSISTENCY.md) for deliberate recovery and legacy compatibility.
+
 ## Record evidence and recover context
 
 `status`, `recent`, and `run` output is bounded by characters as well as lines.
@@ -92,10 +99,30 @@ Full logs stay in `runs/`; the CLI digests them incrementally after a foreground
 command exits. A successful exit records execution success, not research validity.
 Use `recent --thread baseline --grep 'E042' -n 5` for relevant events.
 
-Use `catalog --query E042 -n 5` to find bounded experiment metadata, then
-`show E042 --section record` or `--section sources` for its exact recipe, progress,
-findings, and artifact pointers. Queries do not scan repository contents or remote
-hosts. The latest correction stays visible when a query matched an earlier claim.
+Start with the project's short entry, registered active context and hub status.
+Then follow metadata index → relevant thread → `catalog` / `show` → exact cited
+evidence. Use `catalog --query E042 -n 5`, followed by `show E042 --section record`
+or `--section sources`, to recover a recipe, progress, findings and artifact
+pointers. Disclose missing records rather than loading the whole repository.
+Queries do not scan repository contents or remote hosts. The latest correction
+stays visible when a query matched an earlier claim.
+
+The optional [generic context reader](INDEXED_READING.md) queries an explicit
+metadata index and reads only exact registered file slices. Unindexed inputs are
+refused by that reader; no OS isolation or restriction on other tools is implied.
+
+`check` caps STATE at 120 lines / 8,000 UTF-8 bytes and each thread at 80 lines /
+6,000 bytes. Aim for STATE around 3 KB and active threads around 1–3 KB. These
+size limits are separate from query character caps. Preserve readable prose,
+normal spaces and paragraphs; expand unfamiliar abbreviations. Move detail behind
+indexed pointers instead of deleting spaces or dropping failures and corrections.
+
+`show ORIGINAL_SOURCE_ID` also finds a historical import when no direct event or
+experiment ID matches. It labels the original source ID separately from the new
+ingestion event UUID; it does not replay historical ownership or acceptance.
+If multiple source namespaces collide, use `catalog --updates --query
+ORIGINAL_SOURCE_ID` (or query its namespace), then select the exact ingestion
+event UUID shown with that source identity.
 
 For new research updates, fill [RECORD_TEMPLATE.json](RECORD_TEMPLATE.json) and
 use `log --thread baseline --record /path/to/record.json` under the held claim.

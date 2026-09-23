@@ -254,6 +254,75 @@ class MemoryHighlightsTests(unittest.TestCase):
         result = self.run_cli("highlight", "verify", identity, succeeds=False)
         self.assertIn("ledger prefix", result.stderr)
 
+    def test_independent_insertions_preserve_snapshot_and_external_restore(self):
+        self.claim()
+        self.run_cli("log", "--id", "PRIOR", "--note", "Captured prior observation")
+        identity = self.capture()["id"]
+        ledger_path = self.hub / "ledger.jsonl"
+        lines = self.ledger_bytes().splitlines(keepends=True)
+        inserted = {"event_id": uuid.uuid4().hex, "kind": "finding", "id": "MERGED-OTHER",
+                    "ts": "2026-09-22T00:00:00+00:00", "note": "Independent event from reconciled history"}
+        extra = (json.dumps(inserted) + "\n").encode()
+        merged = lines[0] + extra + b"".join(lines[1:])
+        ledger_path.write_bytes(merged)
+        self.assertTrue(self.view("highlight", "verify", identity)["verified"])
+        report = self.view("highlight", "show", identity)["history_verification"]
+        self.assertEqual(report["relation"], "captured_events_preserved_with_insertions")
+        self.assertEqual(report["captured_event_count"], 2)
+        self.assertEqual(report["inserted_event_count"], 1)
+        self.assertTrue(report["original_relative_order_preserved"])
+        self.assertTrue(report["warning"])
+        destination = self.root / "restore-reconciled-history"
+        restored = self.view("highlight", "restore", identity, "--destination", destination)
+        self.assertEqual(restored["history_verification"], report)
+        self.assertEqual((destination / "frozen_files/notes/result.md").read_bytes(), self.source.read_bytes())
+        self.assertEqual((destination / "ledger-prefix.jsonl").read_bytes(), b"".join(lines[:-1]))
+        self.assertEqual(ledger_path.read_bytes(), merged)
+
+    def test_history_fallback_rejects_reordering_missing_changed_and_duplicate_events(self):
+        self.claim()
+        self.run_cli("log", "--id", "PRIOR", "--note", "Captured prior observation")
+        identity = self.capture()["id"]
+        ledger_path = self.hub / "ledger.jsonl"
+        lines = self.ledger_bytes().splitlines(keepends=True)
+        changed = json.loads(lines[0])
+        changed["note"] = "Changed existing event content"
+        cases = {
+            "reordered": [lines[1], lines[0], *lines[2:]],
+            "missing": lines[1:],
+            "changed": [(json.dumps(changed) + "\n").encode(), *lines[1:]],
+            "duplicate": [*lines, lines[0]],
+        }
+        for label, altered in cases.items():
+            with self.subTest(label=label):
+                ledger_path.write_bytes(b"".join(altered))
+                self.run_cli("highlight", "verify", identity, succeeds=False)
+                destination = self.root / ("rejected-" + label)
+                self.run_cli("highlight", "restore", identity, "--destination", destination, succeeds=False)
+                self.assertFalse(destination.exists())
+
+    def test_history_fallback_rejects_reserialized_original_line(self):
+        self.claim()
+        identity = self.capture()["id"]
+        lines = self.ledger_bytes().splitlines(keepends=True)
+        same_event = json.loads(lines[0])
+        lines[0] = (json.dumps(same_event, separators=(",", ":")) + "\n").encode()
+        (self.hub / "ledger.jsonl").write_bytes(b"".join(lines))
+        result = self.run_cli("highlight", "verify", identity, succeeds=False)
+        self.assertIn("line bytes changed", result.stderr)
+
+    def test_legacy_prefix_without_uuid_does_not_allow_insertion_fallback(self):
+        legacy = {"ts": "2020-01-01T00:00:00+00:00", "kind": "exp", "id": "OLD"}
+        (self.hub / "ledger.jsonl").write_text(json.dumps(legacy) + "\n")
+        self.claim()
+        identity = self.capture()["id"]
+        exact = self.view("highlight", "show", identity)["history_verification"]
+        self.assertEqual(exact["relation"], "exact_prefix")
+        lines = self.ledger_bytes().splitlines(keepends=True)
+        inserted = {"event_id": uuid.uuid4().hex, "ts": "2026-09-22T00:00:00+00:00", "kind": "exp", "id": "NEW"}
+        (self.hub / "ledger.jsonl").write_bytes((json.dumps(inserted) + "\n").encode() + b"".join(lines))
+        self.run_cli("highlight", "verify", identity, succeeds=False)
+
     def test_outside_duplicate_control_secret_and_ignored_inputs_are_rejected(self):
         self.claim()
         (self.repo / ".gitignore").write_text("ignored.txt\n")

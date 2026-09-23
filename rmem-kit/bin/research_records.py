@@ -158,10 +158,12 @@ def catalog_view(hub, events, args):
         if e.get('kind') not in SEMANTIC_KINDS:continue
         match=matching_card(e,reviewed)
         related=[r for _,r in reviewed if r['experiment_id']==e.get('id') and e.get('event_id') not in r['source_event_ids']]
-        haystack=json.dumps({'id':e.get('id'),'event_id':e.get('event_id'),'note':e.get('note'),'record':match,'related_records':related},ensure_ascii=False).casefold()
+        haystack=json.dumps({'id':e.get('id'),'event_id':e.get('event_id'),'source_id':e.get('source_id'),
+                            'source_namespace':e.get('source_namespace'),'note':e.get('note'),'record':match,'related_records':related},ensure_ascii=False).casefold()
         hit=(not args.thread or e.get('thread')==args.thread) and (not query or query in haystack)
         row={'sequence':e.get('sequence',ordinal),'sequence_source':'stored' if 'sequence' in e else 'derived_current_ledger_position',
              'event_id':e.get('event_id'),'experiment_id':e.get('id'),'source_namespace':e.get('source_namespace'),
+             'source_id':e.get('source_id'),
              'updated':e.get('ts'),'thread':e.get('thread'),'status':e.get('status'),
              'summary':(e.get('research',{}).get('summary') or e.get('note') or '')[:320],
              'record':record_summary(match),'structured':bool(match),
@@ -239,6 +241,14 @@ def show_view(hub, events, identifier, section):
     if any(e.get('kind')=='CORRUPT' for e in events):raise ValueError('Ledger is corrupt; run check before recovery')
     exact=[e for e in events if e.get('event_id')==identifier]
     history=exact or [e for e in events if e.get('id')==identifier]
+    historical_source_lookup=False
+    if not history:
+        imports=[e for e in events if e.get('kind')=='import' and e.get('source_id')==identifier]
+        if len({e.get('source_namespace') for e in imports})>1:
+            raise ValueError('Historical source ID spans multiple source namespaces; choose exact ingestion event_id from catalog')
+        if imports:
+            history=imports
+            historical_source_lookup=True
     if not history:
         matches=[(p,r) for p,r in cards(hub) if r['experiment_id']==identifier]
         if not matches:raise ValueError('Unknown exact experiment/event ID; use catalog --query. No historical whole-repository fallback.')
@@ -261,6 +271,10 @@ def show_view(hub, events, identifier, section):
             'record_file_paths':[str(p.relative_to(hub)) for p,r in reviewed if r['experiment_id']==latest.get('id') or latest.get('event_id') in r['source_event_ids']],
             'source_file_paths':[x['path'] for x in latest.get('sources',[])][:20],
             'limits':'Latest exact ID update, not a merged scientific conclusion. Related cohort IDs and corrections must be followed explicitly.'}
+    if historical_source_lookup:
+        result.update(lookup_kind='historical_import_source_id', original_source_id=identifier,
+                      source_namespace=latest.get('source_namespace'), ingestion_event_id=latest.get('event_id'))
+        result['limits']='Historical import located by original source ID. event_id and ingestion_event_id identify the new ledger ingestion, not the original event. Follow the immutable sources for the original body; no historical claim, execution or acceptance is replayed.'
     if section in {'all','history'}:result['history']=hs[-20:];result['history_total']=len(hs)
     if section in {'all','record'}:
         result['record']=match
@@ -272,4 +286,9 @@ def show_view(hub, events, identifier, section):
     if section in {'all','sources'}:
         result['sources']=source_locations(hub,latest);result['artifacts']=latest.get('artifacts',[])
     if section=='all':result['event']={k:v for k,v in latest.items() if k not in {'sources','research'}}
-    return bounded(result)
+    view=bounded(result)
+    if historical_source_lookup and 'lookup_kind' not in view:
+        for key in ('lookup_kind','original_source_id','source_namespace','ingestion_event_id','event_id'):
+            view[key]=result[key]
+        view['lookup_limits']=result['limits']
+    return view

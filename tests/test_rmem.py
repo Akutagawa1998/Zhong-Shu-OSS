@@ -251,7 +251,15 @@ class RmemTests(unittest.TestCase):
         self.assertIn("ledger", result.stdout)
         self.call("status")
         self.call("claim", "empty", ok=False)
-        self.call("claim", "empty", "--force", "--reason", "recover incomplete claim")
+        before = (self.hub / "ledger.jsonl").read_bytes()
+        self.call("claim", "empty", "--force", "--reason", "recover incomplete claim", ok=False)
+        self.assertEqual((self.hub / "ledger.jsonl").read_bytes(), before)
+
+    def test_incomplete_claim_can_be_recovered_with_valid_ledger(self):
+        (self.hub / "claims/empty").mkdir()
+        self.call("claim", "empty", ok=False)
+        self.call("claim", "empty", "--force", "--reason", "reviewed incomplete claim")
+        self.call("check")
 
     def test_import_is_idempotent_and_conflicts_do_not_append(self):
         source = self.root / "old.log"

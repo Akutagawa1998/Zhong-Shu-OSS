@@ -57,9 +57,21 @@ python3 .research-memory/bin/rmem highlight verify hl-EXACT_UUID
 
 List/show output is bounded and includes a manifest pointer when detail is too
 large. Lookup compares actual zoned instants. Verification checks copied bytes,
-file coverage, manifest hash, unique ledger anchor, and unchanged historical
-ledger prefix. Subsequent ledger appends are allowed. It does not reread mutable
-original files or reinterpret reported findings as accepted results.
+file coverage, manifest hash, unique ledger anchor, and historical event bytes.
+An unchanged continuous ledger prefix is reported as `exact_prefix`.
+If Git reconciliation inserted independent new events, verification only accepts
+the original frozen events as an ordered subsequence: every original UUID must
+occur exactly once, each full original JSON line must remain byte-identical, and
+their original relative order must be preserved. This returns
+`captured_events_preserved_with_insertions`, explicit counts and a warning that
+the frozen history is no longer the current continuous prefix. Reordering,
+missing or changed original events, duplicate UUIDs, and inserted rows without
+independent UUIDs are rejected. The original snapshot, prefix hash and manifest
+anchor are never rewritten. Exact-prefix legacy snapshots remain supported;
+the insertion fallback requires stable UUIDs for every frozen event.
+Subsequent appends are allowed. Verification does not reread mutable original
+files or reinterpret reported findings as accepted results. Historical
+validation does not establish the authority of the current ledger ordering.
 `superseded_by` exposes subsequent corrections even when their dates or text are
 outside the requested filter. An older version remains recoverable, with its
 known corrections visible alongside it.
@@ -67,15 +79,14 @@ known corrections visible alongside it.
 ## Recover into a separate directory
 
 ```sh
-python3 .research-memory/bin/rmem highlight restore hl-EXACT_UUID --destination /tmp/project-historical-review
+python3 .research-memory/bin/rmem highlight restore hl-EXACT_UUID --destination /absolute/non-symlink/path/project-historical-review
 ```
 
 The destination must be new or empty, outside the live Git repository, hub and
-control directories. Its parent must exist and the destination must use canonical directories without
-symlink ancestors (for example, resolve the system temporary directory first).
-On macOS, `/tmp` normally resolves to `/private/tmp`; use the canonical path for
-both snapshot specs and restore destinations rather than relaxing validation. `frozen_files/` contains the selected
+control directories. Its parent must exist. `frozen_files/` contains the selected
 paths and exact bytes; the manifest and ledger prefix accompany them. This is a
 historical review artifact. No current files, controller, claims, scheduler jobs,
 automation or research mode are restored, changed, enabled, or executed. A later
 decision to adopt old material must follow the current thread/claim protocol.
+
+Use canonical paths without symlink ancestors for specs and restore destinations. On macOS, `/tmp` is a symlink to `/private/tmp`; use the latter when choosing a temporary review directory.
