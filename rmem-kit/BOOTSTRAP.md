@@ -59,3 +59,11 @@ actions; importing history never starts jobs or enables automation.
 After migration, prefer project-relative artifact paths. Preserve old source
 locations as provenance and map them to new paths in MAP; historical hashes remain
 useful after a path moves. Audit reports are not live state.
+
+Before handing the hub to working sessions, list the project's session roles
+under `roles` in `hub-config.json` (with the threads each role owns), record the
+collaboration rules that so far lived in one agent's private memory as lessons
+(`rmem lesson add --rule … --why … --quote …`), turn open "REQUEST TO …" notes
+into `rmem request` entries, and decide whether to install the optional session
+hooks (`rmem hooks install --claude`, a dry run without `--write`). See
+[HANDOFF.md](HANDOFF.md).

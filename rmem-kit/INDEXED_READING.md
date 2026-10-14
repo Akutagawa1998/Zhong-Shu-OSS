@@ -1,11 +1,12 @@
 # Layered, readable context recovery
 
-Keep STATE near **3 KB of UTF-8 text** and each active thread near **1–3 KB**.
-These are editorial targets, not new rejection thresholds. `rmem check` retains
-the existing hard caps: STATE 120 lines / 8,000 bytes; threads 80 lines / 6,000
-bytes. Explain unfamiliar abbreviations and keep normal spaces, sentences and
-paragraphs. Do not delete spaces, flatten a document into dense lines, or remove
-failures and caveats to fit a cap. Move details behind explicit indexed pointers.
+Keep STATE near **3,000 characters** and each active thread near **1,000–3,000
+characters**. These are editorial targets. `rmem check` enforces the hard caps
+from `hub-config.json`, counted in characters, and warns from the soft ratio on;
+see [CONFIG.md](CONFIG.md) for the keys and defaults. Explain unfamiliar
+abbreviations and keep normal spaces, sentences and paragraphs. Do not delete
+spaces, flatten a document into dense lines, or remove failures and caveats to
+fit a cap. Move details behind explicit indexed pointers.
 
 After the project's short entry, registered current-context instructions and
 hub status, recover in this order:

@@ -88,16 +88,19 @@ class MemoryHighlightsTests(unittest.TestCase):
             self.assertTrue((self.hub / name).is_file(), name)
         self.assertEqual(self.view("highlight", "list")["rows"], [])
 
-    def test_creation_requires_matching_project_state_claim_atomically(self):
-        before = self.ledger_bytes()
-        self.capture(succeeds=False)
-        self.assertEqual(self.ledger_bytes(), before)
+    def test_creation_follows_the_project_state_lease_atomically(self):
+        # project-state is the protocol's own thread, so a fresh hub accepts a highlight without any claim.
+        self.assertFalse((self.hub / "threads/project-state.md").exists())
+        self.assertEqual(uuid.UUID(self.capture()["id"][3:]).version, 4)
         self.claim()
         before = self.ledger_bytes()
-        self.capture(succeeds=False, session="wrong-owner")
+        self.capture(succeeds=False, session="wrong-owner")  # another session's live lease
         self.assertEqual(self.ledger_bytes(), before)
         receipt = self.capture()
         self.assertEqual(uuid.UUID(receipt["id"][3:]).version, 4)
+        # Since 0.4.0 no claim is needed once nobody else holds a live lease.
+        self.run_cli("release", "project-state")
+        self.assertEqual(uuid.UUID(self.capture(session="later-session")["id"][3:]).version, 4)
 
     def test_copy_preserves_bytes_identity_git_state_and_ledger_cutoff(self):
         self.claim()
@@ -109,7 +112,10 @@ class MemoryHighlightsTests(unittest.TestCase):
         directory = self.snapshot(receipt["id"])
         manifest = json.loads((directory / "MANIFEST.json").read_text())
         self.assertEqual((directory / "files/notes/result.md").read_bytes(), original)
-        self.assertEqual((directory / "ledger-prefix.jsonl").read_bytes(), before)
+        # 0.4 (manifest v2) records the cutoff instead of copying the ledger.
+        self.assertEqual(manifest["schema_version"], 2)
+        self.assertFalse((directory / "ledger-prefix.jsonl").exists())
+        self.assertEqual(manifest["ledger_prefix"]["bytes"], len(before))
         self.assertEqual(manifest["ledger_prefix"]["sha256"], hashlib.sha256(before).hexdigest())
         self.assertEqual(manifest["source_repository"]["revision"], self.git("rev-parse", "HEAD"))
         self.assertTrue(manifest["source_repository"]["dirty"])
@@ -141,7 +147,13 @@ class MemoryHighlightsTests(unittest.TestCase):
         self.assertEqual(captured["matching_count"], 2)
         self.assertEqual(self.view("highlight", "show", second["id"])["supersedes"], [first["id"]])
         self.assertEqual(self.view("highlight", "show", first["id"])["superseded_by"][0]["highlight_id"], second["id"])
-        self.run_cli("highlight", "list", "--since", "2026-09-20T12:00:00", succeeds=False)
+        self.run_cli("highlight", "list", "--since", "not a time", succeeds=False)
+        # A time without an offset is read in the display zone; an age counts back from now.
+        self.env["RMEM_TZ"] = "UTC"
+        local = self.view("highlight", "list", "--since", "2026-09-20 12:00")
+        del self.env["RMEM_TZ"]
+        self.assertEqual([row["highlight_id"] for row in local["rows"]], [second["id"]])
+        self.assertEqual(self.view("highlight", "list", "--since", "100000d")["matching_count"], 2)
 
     def test_old_keyword_lookup_displays_later_correction_outside_filter(self):
         self.claim()
@@ -404,6 +416,171 @@ class MemoryHighlightsTests(unittest.TestCase):
         self.assertEqual(view["manifest"], f"highlights/{identity}/MANIFEST.json")
         manifest = json.loads((self.snapshot(identity) / "MANIFEST.json").read_text())
         self.assertEqual(manifest["spec"]["experiment_ids"], spec["experiment_ids"])
+
+    # 0.4: manifest v2 records line digests instead of copying the ledger.
+
+    def append_bulk(self, count, note_chars=400):
+        """Grow the ledger quickly with valid events (direct appends stand in for many sessions)."""
+        ledger = self.hub / "ledger.jsonl"
+        sequence = len(ledger.read_bytes().splitlines())
+        with ledger.open("a") as stream:
+            for index in range(count):
+                sequence += 1
+                stream.write(json.dumps({"ts": "2026-10-01T00:00:00+00:00", "kind": "exp", "agent": "test",
+                                         "id": f"BULK-{sequence}", "note": "x" * note_chars,
+                                         "event_id": uuid.uuid4().hex, "sequence": sequence}) + "\n")
+
+    def snapshot_bytes(self, identity):
+        return sum(path.stat().st_size for path in self.snapshot(identity).rglob("*") if path.is_file())
+
+    def manifest(self, identity):
+        return json.loads((self.snapshot(identity) / "MANIFEST.json").read_text())
+
+    def test_v2_snapshot_size_does_not_grow_with_the_ledger(self):
+        self.claim()
+        first = self.capture()["id"]
+        self.append_bulk(300)
+        second = self.capture()["id"]
+        third = self.capture()["id"]
+        ledger_size = len(self.ledger_bytes())
+        self.assertGreater(ledger_size, 120000)
+        # The second lists only the 300 new lines; the third only the anchor line after the second.
+        self.assertEqual(self.manifest(second)["ledger_prefix"]["base"]["highlight_id"], first)
+        self.assertEqual(self.manifest(third)["ledger_prefix"]["base"]["highlight_id"], second)
+        self.assertEqual(self.manifest(third)["ledger_prefix"]["digests_count"], 1)
+        self.assertLess(self.snapshot_bytes(third), 6000)
+        self.assertLess(self.snapshot_bytes(second), ledger_size // 5)
+        for identity in (first, second, third):
+            self.assertFalse((self.snapshot(identity) / "ledger-prefix.jsonl").exists())
+            self.assertEqual(self.view("highlight", "verify", identity)["history_verification"]["relation"], "exact_prefix")
+            self.assertEqual(self.view("highlight", "verify", identity)["ledger_storage"], "line_digests")
+
+    def test_v2_base_chain_is_bounded_by_a_full_list_every_sixteenth_highlight(self):
+        self.claim()
+        identities = [self.capture()["id"] for _ in range(17)]
+        depths = [self.manifest(identity)["ledger_prefix"]["chain_depth"] for identity in identities]
+        self.assertEqual(depths, list(range(16)) + [0])
+        last = self.manifest(identities[-1])["ledger_prefix"]
+        self.assertIsNone(last["base"])
+        self.assertEqual(last["digests_count"], last["line_count"])
+        self.assertEqual(self.view("highlight", "verify", identities[15])["history_verification"]["relation"], "exact_prefix")
+
+    def test_v2_verifies_after_appends_and_insertions_and_restores_from_the_live_ledger(self):
+        self.claim()
+        self.run_cli("log", "--id", "PRIOR", "--note", "Captured prior observation")
+        first = self.capture()["id"]
+        second = self.capture()["id"]
+        captured = self.ledger_bytes().splitlines(keepends=True)[:-1]  # everything before the second anchor
+        self.run_cli("log", "--id", "LATER", "--note", "Appended after both highlights")
+        for identity in (first, second):
+            self.assertEqual(self.view("highlight", "verify", identity)["history_verification"]["relation"], "exact_prefix")
+        lines = self.ledger_bytes().splitlines(keepends=True)
+        inserted = {"event_id": uuid.uuid4().hex, "kind": "finding", "id": "MERGED-OTHER",
+                    "ts": "2026-09-22T00:00:00+00:00", "note": "Independent event from another device"}
+        merged = lines[0] + (json.dumps(inserted) + "\n").encode() + b"".join(lines[1:])
+        (self.hub / "ledger.jsonl").write_bytes(merged)
+        for identity in (first, second):
+            report = self.view("highlight", "verify", identity)["history_verification"]
+            self.assertEqual(report["relation"], "captured_events_preserved_with_insertions")
+            self.assertEqual(report["inserted_event_count"], 1)
+        destination = self.root / "restore-second"
+        restored = self.view("highlight", "restore", second, "--destination", destination)
+        self.assertEqual(restored["history_verification"]["inserted_event_count"], 1)
+        self.assertEqual((destination / "ledger-prefix.jsonl").read_bytes(), b"".join(captured))
+        self.assertTrue((destination / "ledger-lines.txt").is_file())
+        self.assertIn("rebuilt from the live ledger", (destination / "RESTORE_README.txt").read_text())
+        self.assertEqual(self.ledger_bytes(), merged)
+
+    def test_v2_restore_fails_clearly_when_the_live_ledger_lost_captured_events(self):
+        self.claim()
+        self.run_cli("log", "--id", "PRIOR", "--note", "Captured prior observation")
+        identity = self.capture()["id"]
+        lines = self.ledger_bytes().splitlines(keepends=True)
+        (self.hub / "ledger.jsonl").write_bytes(lines[0] + b"".join(lines[2:]))
+        destination = self.root / "must-not-appear"
+        result = self.run_cli("highlight", "restore", identity, "--destination", destination, succeeds=False)
+        self.assertIn("cannot restore", result.stderr)
+        self.assertIn("line digests", result.stderr)
+        self.assertIn("captured event is missing", result.stderr)
+        self.assertFalse(destination.exists())
+
+    def test_v2_highlight_depends_on_its_base_and_reports_a_broken_one(self):
+        self.claim()
+        first = self.capture()["id"]
+        second = self.capture()["id"]
+        lines = self.snapshot(first) / "ledger-lines.txt"
+        lines.chmod(0o600)
+        lines.write_text(lines.read_text().replace("0", "1", 1))
+        for identity in (first, second):
+            self.run_cli("highlight", "verify", identity, succeeds=False)
+        self.assertIn(f"base highlight {first}", self.run_cli("highlight", "verify", second, succeeds=False).stderr)
+        check = self.run_cli("check", succeeds=False).stdout
+        self.assertIn(f"highlight {first} does not verify", check)
+        self.assertIn(f"highlight {second} does not verify", check)
+
+    def test_freeze_ledger_keeps_the_v1_copy_and_old_highlights_still_work(self):
+        self.claim()
+        before = self.ledger_bytes()
+        self.spec_path.write_text(json.dumps(self.spec()))
+        frozen = json.loads(self.run_cli("highlight", "create", self.spec_path, "--freeze-ledger").stdout)["id"]
+        manifest = self.manifest(frozen)
+        self.assertEqual(manifest["schema_version"], 1)
+        self.assertEqual((self.snapshot(frozen) / "ledger-prefix.jsonl").read_bytes(), before)
+        self.assertEqual(self.view("highlight", "verify", frozen)["ledger_storage"], "copy")
+        newer = self.capture()["id"]
+        self.assertIsNone(self.manifest(newer)["ledger_prefix"]["base"])  # a v1 highlight is never a base
+        rows = self.view("highlight", "list")["rows"]
+        self.assertEqual({row["highlight_id"] for row in rows}, {frozen, newer})
+        self.assertEqual(self.view("highlight", "show", frozen)["ledger_storage"], "copy")
+        destination = self.root / "restore-v1"
+        self.view("highlight", "restore", frozen, "--destination", destination)
+        self.assertEqual((destination / "ledger-prefix.jsonl").read_bytes(), before)
+        self.assertFalse((destination / "ledger-lines.txt").exists())
+
+    def test_index_lists_newest_first_with_superseding_links_and_stays_current(self):
+        self.claim()
+        first = self.capture()["id"]
+        correction = self.spec()
+        correction.update(kind="correction", title="Corrected | result", evidence_status="retracted",
+                          occurred_at="2026-09-21T12:00:00+00:00", supersedes=[first])
+        second = self.capture(correction)["id"]
+        preview = self.run_cli("highlight", "index").stdout
+        self.assertIn("dry run", preview)
+        self.assertFalse((self.hub / "HIGHLIGHTS_INDEX.md").exists())
+        self.assertLess(preview.index(second), preview.index(f"| [{first}]"))
+        self.assertIn(f"[{second}](highlights/{second}/MANIFEST.json) (retracted)", preview)
+        self.assertIn("Corrected \\| result", preview)
+        self.run_cli("highlight", "index", "--write")
+        index = (self.hub / "HIGHLIGHTS_INDEX.md").read_text()
+        self.assertEqual(index, preview[:len(index)])
+        third = self.capture()["id"]
+        self.assertIn(third, (self.hub / "HIGHLIGHTS_INDEX.md").read_text())
+
+    def test_verify_and_check_warn_when_git_ignores_snapshot_files(self):
+        self.claim()
+        source = self.repo / "analysis/runs/summary.md"
+        source.parent.mkdir(parents=True)
+        source.write_text("Summary kept as evidence.\n")
+        spec = self.spec()
+        spec["files"] = ["analysis/runs/summary.md"]
+        identity = self.capture(spec)["id"]
+        self.assertNotIn("warnings", self.view("highlight", "verify", identity))
+        with (self.hub / ".gitignore").open("a") as stream:
+            stream.write("runs/\n")  # the unanchored rule of hubs installed before 0.4
+        warnings = self.view("highlight", "verify", identity)["warnings"]
+        self.assertIn(f"highlights/{identity}/files/analysis/runs/summary.md", warnings[0])
+        self.assertIn("/runs/", warnings[0])
+        self.assertIn("ignored by Git", self.run_cli("check").stdout)
+
+    def test_check_verifies_highlights_and_fails_on_tampering(self):
+        self.claim()
+        identity = self.capture()["id"]
+        self.assertNotIn("does not verify", self.run_cli("check").stdout)
+        frozen = self.snapshot(identity) / "files/notes/result.md"
+        frozen.chmod(0o600)
+        frozen.write_text("tampered\n")
+        result = self.run_cli("check", succeeds=False)
+        self.assertIn(f"highlight {identity} does not verify: frozen file hash/size mismatch", result.stdout)
 
 
 if __name__ == "__main__":

@@ -104,7 +104,7 @@ class ResearchMemoryTests(unittest.TestCase):
         self.assertEqual([event["sequence"] for event in events], list(range(1, len(events) + 1)))
         self.assertEqual([e["research"]["steps"]["completed"] for e in events if "research" in e], [0, 2])
 
-    def test_record_requires_thread_and_matching_claim_without_partial_append(self):
+    def test_record_requires_thread_and_no_other_live_lease_without_partial_append(self):
         record_path = self.save_record(self.record())
         before = self.ledger.read_bytes()
         self.run_cli("log", "--record", record_path, succeeds=False)
@@ -117,6 +117,10 @@ class ResearchMemoryTests(unittest.TestCase):
         self.assertEqual(self.ledger.read_bytes(), before)
         self.log_record(self.record())
         self.assertEqual(self.events()[-1]["session"], self.session)
+        # Since 0.4.0 a thread write needs no claim once nobody else holds a live lease.
+        self.run_cli("release", "experiment")
+        self.log_record(self.record(completed=1), session="different-session")
+        self.assertEqual(self.events()[-1]["session"], "different-session")
 
     def test_missing_or_empty_inference_dataset_is_rejected_atomically(self):
         self.run_cli("claim", "experiment")

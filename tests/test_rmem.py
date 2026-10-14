@@ -19,7 +19,7 @@ class RmemTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix="rmem-test-")
         self.root = Path(self.tmp.name).resolve()
         self.hub = self.root / "hub"
-        self.env = {k: v for k, v in os.environ.items() if not k.startswith("RMEM_")}
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith(("RMEM_", "CODEX_", "CLAUDE"))}
         self.env["RMEM_HUB"] = str(self.hub)
         self.env["RMEM_SESSION"] = "session-a"
         self.env["RMEM_AGENT"] = "codex"
@@ -138,7 +138,7 @@ class RmemTests(unittest.TestCase):
         self.call("log", "--note", "do not write", ok=False)
         self.assertEqual((victim / "keep").read_text(), "keep me")
 
-    def test_thread_logs_and_runs_require_owner(self):
+    def test_thread_logs_and_runs_are_refused_under_another_live_lease(self):
         self.claim()
         other = {**self.env, "RMEM_SESSION": "session-b"}
         self.call("log", "--thread", "alpha", "--note", "bad", env=other, ok=False)
@@ -417,8 +417,11 @@ class RmemTests(unittest.TestCase):
         self.assertEqual(event["sources"][0]["relative_path"], "old.log")
         self.assertEqual(event["sources"][0]["base"], str(self.root))
         self.assertEqual(event["supersedes"], "legacy:record-1")
-        for invalid in ("yesterday", "2020-01-02T03:04:05"):
-            self.call("log", "--event-time", invalid, ok=False)
+        for invalid in ("yesterday", "2h"):
+            self.assertIn("--event-time", self.call("log", "--event-time", invalid, ok=False).stderr)
+        # A time without an offset is read in the display zone, as CONFIG.md promises for every time option.
+        self.call("log", "--event-time", "2020-01-02 03:04", env={**self.env, "RMEM_TZ": "America/Los_Angeles"})
+        self.assertEqual(self.events()[-1]["event_time"], "2020-01-02T03:04:00-08:00")
 
     def test_metadata_shape_and_unicode_claim_notes(self):
         self.call("claim", "unicode", "--note", "🧪" * 1000)

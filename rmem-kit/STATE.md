@@ -1,5 +1,5 @@
 # STATE — <project name>
-<!-- Budget: 120 lines; keep this file concise. -->
+<!-- Budget: caps.state_max_lines / state_max_chars in hub-config.json (see CONFIG.md); keep this file concise. -->
 
 ## Goal
 Not configured. Define the research question and completion criteria from verified project sources.

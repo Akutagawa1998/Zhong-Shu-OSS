@@ -6,12 +6,14 @@ sessions. It does not isolate source worktrees, reserve GPUs, or distribute lock
 between independently cloned hubs. Markdown remains ordinary, editable data.
 """
 import argparse
-from collections import deque
+from collections import Counter, deque
 from contextlib import contextmanager
 import datetime as dt
+import difflib
 import errno
 import fcntl
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -26,24 +28,54 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 import uuid
 
 from research_records import (catalog_view, coverage_view, load_record_file,
                               show_view, validate_record)
 import research_highlights as highlights
-from research_consistency import claim_issues, ownership_history
+from research_consistency import (RESOURCE_PREFIX, claim_issues, lease_state, ownership_history,
+                                  same_owner, session_activity)
+import research_handoff as handoff
+import research_identity as identity
+import rmem_config
+import research_queries as queries
+import research_git
+import research_lifecycle as lifecycle
+import research_upgrade
 
-STATE_MAX_LINES = 120
-THREAD_MAX_LINES = 80
-STATE_MAX_CHARS = 8000
-THREAD_MAX_CHARS = 6000
-OUTPUT_MAX_CHARS = 16000
+# Built-in feature modules (stdlib files in bin/): one import line and one entry each.
+# WHY: handoff comes first so requests addressed to the caller lead the module lines in status.
+FEATURE_MODULES = [handoff, identity, queries, research_git, lifecycle, research_upgrade]
+
+# Defaults only; a hub's hub-config.json overrides them (see CONFIG.md).
+_CAPS = rmem_config.DEFAULTS["caps"]
+STATE_MAX_LINES = _CAPS["state_max_lines"]
+THREAD_MAX_LINES = _CAPS["thread_max_lines"]
+STATE_MAX_CHARS = _CAPS["state_max_chars"]
+THREAD_MAX_CHARS = _CAPS["thread_max_chars"]
+OUTPUT_MAX_CHARS = _CAPS["output_max_chars"]
+SOFT_RATIO = _CAPS["soft_ratio"]
 LINE_MAX_CHARS = 1200
 EVENT_MAX_CHARS = 65536
-STALE_CLAIM_HOURS = 12
+SECTION_MAX_LINES = 40
 BLOCK_START, BLOCK_END = "<!-- RMEM:START -->", "<!-- RMEM:END -->"
 SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}\Z")
 SAFE_SESSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:@+-]{0,127}\Z")
+PLUGIN_FILE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}\.py\Z")
+RELATIVE_TIME = re.compile(r"([0-9]{1,6})([mhd])\Z")
+READ_ONLY_ERRNOS = (errno.EACCES, errno.EPERM, errno.EROFS)
+MANIFEST_NAME = ".kit-manifest.json"
+CORE_EVENT_KINDS = {"exp", "decision", "finding", "todo", "import", "claim", "release",
+                    "run_started", "run", "link", "highlight_created"}
+CORE_STRING_FIELDS = ("agent", "session", "id", "thread", "status", "note", "commit", "log",
+                      "source_id", "source_namespace", "run_id", "host", "scheduler", "job_id",
+                      "event_id", "event_time", "supersedes")
+UNLOCKED_HUBS = set()   # hubs read in this process without the lock (read-only access)
+PLUGINS = []            # loaded project plugins, as module entries
+BROKEN_MODULES = {}     # label -> {"origin", "error"}; reported by doctor and check
+_MODULE_TABLE = None
+_CONFIG_CACHE = {}
 
 
 class RmemError(Exception):
@@ -52,6 +84,85 @@ class RmemError(Exception):
 
 def now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="microseconds")
+
+
+def kit_root() -> Path:
+    """The kit (or installed hub) directory that holds this bin/rmem."""
+    return Path(__file__).resolve().parent.parent
+
+
+def kit_version() -> str:
+    try:
+        return one_line((kit_root() / "VERSION").read_text(encoding="utf-8").strip(), "VERSION", 64)
+    except (OSError, UnicodeError, RmemError):
+        return "unknown"
+
+
+def load_config(hub: Path) -> dict:
+    """Merged hub configuration (cached per process); invalid values raise RmemError."""
+    key = str(hub)
+    if key not in _CONFIG_CACHE:
+        try:
+            _CONFIG_CACHE[key] = rmem_config.load(hub) + (None,)
+        except rmem_config.ConfigError as exc:
+            _CONFIG_CACHE[key] = (None, [], f"{exc}; fix or remove each key named here (rmem doctor lists the same problems)")
+    config, _, error = _CONFIG_CACHE[key]
+    if error:
+        raise RmemError(error)
+    return config
+
+
+def config_report(hub: Path):
+    """(config, error, warnings) for check and doctor; defaults stand in for an invalid file."""
+    try:
+        load_config(hub)
+    except RmemError:
+        pass
+    config, warnings, error = _CONFIG_CACHE[str(hub)]
+    return (config or rmem_config.defaults()), error, warnings
+
+
+def display_zone(config=None):
+    if config is not None:
+        return rmem_config.zone(config)
+    try:
+        return rmem_config.zone({"display_tz": os.environ.get("RMEM_TZ") or None})
+    except (ValueError, KeyError):
+        return None
+
+
+def display_time(ts, config=None) -> str:
+    """Stored UTC ISO time → '2026-10-14 01:34 PDT' in display_tz (RMEM_TZ, else system zone)."""
+    try:
+        parsed = dt.datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except ValueError:
+        return clipped(ts, 40)
+    if parsed.tzinfo is None:
+        return parsed.strftime("%Y-%m-%d %H:%M") + " (no zone)"
+    local = parsed.astimezone(display_zone(config))
+    return local.strftime("%Y-%m-%d %H:%M ") + (local.tzname() or local.strftime("UTC%z"))
+
+
+def parse_user_time(value, config=None) -> dt.datetime:
+    """ISO 8601 with offset, naive 'YYYY-MM-DD[ HH:MM[:SS]]' in the display zone, or an age like 90m/6h/3d."""
+    text = str(value).strip()
+    match = RELATIVE_TIME.fullmatch(text)
+    if match:
+        unit = {"m": "minutes", "h": "hours", "d": "days"}[match[2]]
+        try:
+            return dt.datetime.now(dt.timezone.utc) - dt.timedelta(**{unit: int(match[1])})
+        except OverflowError as exc:
+            raise RmemError(f"the age {text!r} reaches before year 1; use a smaller age or a date") from exc
+    try:
+        parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise RmemError(f"cannot read the time {clipped(text, 80)!r}; use ISO 8601 with an offset "
+                        "(2026-10-14T01:34-07:00), a time in the display zone (2026-10-14 01:34), "
+                        "or an age such as 90m, 6h or 3d") from exc
+    if parsed.tzinfo is None:
+        zone = display_zone(config)
+        parsed = parsed.replace(tzinfo=zone) if zone else parsed.astimezone()
+    return parsed.astimezone(dt.timezone.utc)
 
 
 def identifier(value: str) -> str:
@@ -77,14 +188,22 @@ def regex(value: str):
         raise argparse.ArgumentTypeError(f"invalid regex: {exc}") from exc
 
 
-def zoned_timestamp(value: str):
+def original_time(value, config=None) -> str:
+    """--event-time: ISO 8601 with an offset (kept as given) or a time in the display zone; never an age,
+    because it says when something happened."""
+    text = str(value).strip()
+    if RELATIVE_TIME.fullmatch(text):
+        raise RmemError("--event-time is when the event happened, not an age: give 2026-10-14 09:00 (display zone) "
+                        "or ISO 8601 with an offset such as 2026-10-14T09:00-07:00")
     try:
-        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError as exc:
-        raise argparse.ArgumentTypeError("expected an ISO 8601 timestamp with a timezone") from exc
+        raise RmemError(f"cannot read --event-time {clipped(text, 80)!r}; give 2026-10-14 09:00 (display zone) "
+                        "or ISO 8601 with an offset such as 2026-10-14T09:00-07:00") from exc
     if parsed.tzinfo is None:
-        raise argparse.ArgumentTypeError("timestamp must include a timezone")
-    return parsed
+        zone = display_zone(config)
+        parsed = parsed.replace(tzinfo=zone) if zone else parsed.astimezone()
+    return parsed.isoformat()
 
 
 def one_line(value: str, name: str, limit: int = 1000) -> str:
@@ -94,17 +213,17 @@ def one_line(value: str, name: str, limit: int = 1000) -> str:
 
 
 def actor(a, required: bool = False) -> dict:
-    who = a.agent or os.environ.get("RMEM_AGENT")
-    if not who:
-        who = "claude" if os.environ.get("CLAUDECODE") else (
-            "codex" if any(k.startswith("CODEX_") for k in os.environ) else "human")
+    who = a.agent or os.environ.get("RMEM_AGENT") or identity.agent_label()
     try:
         identifier(who)
     except argparse.ArgumentTypeError as exc:
         raise RmemError(f"invalid agent label: {exc}") from exc
-    session = a.session or os.environ.get("RMEM_SESSION")
+    # WHY: shells in Claude Code and Codex forget exported variables between tool calls,
+    # so without --session or RMEM_SESSION the conversation's own ID names the session.
+    session = a.session or os.environ.get("RMEM_SESSION") or identity.derived_session()
     if required and not session:
-        raise RmemError("set a unique RMEM_SESSION (or --session) for this working session")
+        raise RmemError("no session: pass --session ID on every call (exported variables do not persist between "
+                        "agent tool calls), set RMEM_SESSION, or run inside Claude Code or Codex, where rmem derives one")
     if session and not SAFE_SESSION.fullmatch(session):
         raise RmemError("session must be 1–128 letters/digits/._:@+- and start with a letter or digit")
     result = {"agent": who}
@@ -136,15 +255,46 @@ def open_regular(path: Path, flags: int, mode: str):
     return os.fdopen(fd, mode, encoding="utf-8", errors="replace")
 
 
+def open_lock(lock: Path, shared: bool):
+    if shared:
+        # WHY: a reader needs no write access when the lock file already exists.
+        try:
+            return open_regular(lock, os.O_RDONLY, "r")
+        except FileNotFoundError:
+            pass
+    return open_regular(lock, os.O_CREAT | os.O_RDWR, "a+")
+
+
 @contextmanager
-def hub_lock(hub: Path, shared: bool = False):
+def hub_lock(hub: Path, shared: bool = False, readonly_ok: bool = False):
+    """Exclusive for writers. A shared reader with readonly_ok falls back to an
+    unlocked snapshot when the hub is not writable by this process."""
     lock = safe_path(hub, ".rmem.lock")
-    with open_regular(lock, os.O_CREAT | os.O_RDWR, "a+") as stream:
+    stream = None
+    try:
+        stream = open_lock(lock, shared)
         fcntl.flock(stream, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+    except OSError as exc:
+        if stream is not None:
+            stream.close()
+        if exc.errno not in READ_ONLY_ERRNOS:
+            raise
+        if not (shared and readonly_ok):
+            raise RmemError(f"cannot lock the hub ({exc.strerror}: {lock}); this process cannot write to the hub. "
+                            "Run `rmem doctor` for the cause and the harness setting that grants write access") from exc
+        print(f"rmem: note: read without the hub lock ({exc.strerror}: {lock.name}); "
+              "an append in progress is skipped; run `rmem doctor` for access details", file=sys.stderr)
+        UNLOCKED_HUBS.add(hub)
         try:
             yield
         finally:
-            fcntl.flock(stream, fcntl.LOCK_UN)
+            UNLOCKED_HUBS.discard(hub)
+        return
+    try:
+        yield
+    finally:
+        fcntl.flock(stream, fcntl.LOCK_UN)
+        stream.close()
 
 
 @contextmanager
@@ -187,10 +337,21 @@ def validate_hub(hub: Path) -> Path:
     # Claims are ignored runtime state, so a valid Git clone has no claims/.
     # Recreate only this ephemeral directory; never invent missing memory.
     claims = safe_path(hub, "claims")
-    claims.mkdir(exist_ok=True)
+    try:
+        claims.mkdir(exist_ok=True)
+    except OSError as exc:
+        if exc.errno not in READ_ONLY_ERRNOS:
+            raise
+        if not claims.exists() and not claims.is_symlink():
+            return hub  # WHY: a read-only clone still reads; a missing claims/ means no claims.
     if not claims.is_dir():
         raise RmemError(f"expected a claims directory in {hub}")
     return hub
+
+
+def claim_directories(hub: Path) -> list:
+    claims = safe_path(hub, "claims")
+    return sorted(claims.iterdir()) if claims.is_dir() else []
 
 
 def pointer_target(pointer: Path) -> Path:
@@ -202,17 +363,48 @@ def pointer_target(pointer: Path) -> Path:
     return (target if target.is_absolute() else pointer.parent / target).resolve()
 
 
-def find_hub() -> Path:
+def foreign_reason(info, strict: bool = False) -> str:
+    """Why a file or directory (an os.stat result) may hold something another user placed, or ''.
+    Owned by this user or root and not writable by others; strict (code to run) also refuses group write."""
+    if info.st_uid not in (os.geteuid(), 0):
+        return "another user owns it"
+    if info.st_mode & stat.S_IWOTH:
+        return "every user can write to it"
+    if info.st_mode & stat.S_IWGRP and (strict or info.st_uid != os.geteuid()):
+        return "its group can write to it"
+    return ""
+
+
+def discover_hub():
+    """Return (unvalidated hub path, how it was found): RMEM_HUB, a .rmem pointer, or the working directory.
+    The upward search stops at a directory that another user could have written to (like git's
+    safe.directory), so a hub or .rmem planted in a shared directory such as /tmp is never used."""
     if os.environ.get("RMEM_HUB"):
-        return validate_hub(Path(os.environ["RMEM_HUB"]).expanduser().resolve())
+        return Path(os.environ["RMEM_HUB"]).expanduser().resolve(), "RMEM_HUB"
     current = Path.cwd().resolve()
     for directory in (current, *current.parents):
+        try:
+            problem = foreign_reason(directory.stat())
+        except OSError as exc:
+            problem = f"it cannot be read ({exc.strerror})"
+        if problem:
+            raise RmemError(f"no hub found: the search stopped at {directory} because {problem}, so a hub or .rmem "
+                            "there could have been placed by someone else; set RMEM_HUB or run `rmem link PROJECT` "
+                            "from the hub")
         pointer = directory / ".rmem"
         if pointer.exists() or pointer.is_symlink():
-            return validate_hub(pointer_target(pointer))
+            problem = foreign_reason(pointer.lstat())
+            if problem:
+                raise RmemError(f"refusing the hub pointer {pointer}: {problem}; make it yours and not writable by "
+                                "others (chmod go-w), or set RMEM_HUB")
+            return pointer_target(pointer), f".rmem pointer {pointer}"
         if (directory / "STATE.md").is_file() and (directory / "ledger.jsonl").exists():
-            return validate_hub(directory)
+            return directory, f"working directory {directory}"
     raise RmemError("no hub found; set RMEM_HUB or run `rmem link PROJECT` from the hub")
+
+
+def find_hub() -> Path:
+    return validate_hub(discover_hub()[0])
 
 
 def clipped(value, limit: int = 400) -> str:
@@ -221,9 +413,9 @@ def clipped(value, limit: int = 400) -> str:
 
 
 class Output:
-    def __init__(self):
+    def __init__(self, limit: int = OUTPUT_MAX_CHARS):
         self.parts = []
-        self.remaining = OUTPUT_MAX_CHARS - 40
+        self.remaining = limit - 40
         self.truncated = False
 
     def add(self, value=""):
@@ -245,20 +437,24 @@ class Output:
             sys.stdout.write("\n[output truncated; narrow the query]\n")
 
 
-def bounded_lines(path: Path, limit: int = LINE_MAX_CHARS):
-    """Yield line prefixes without ever allocating a complete giant log line."""
+def bounded_lines(path: Path, limit: int = LINE_MAX_CHARS, ends: bool = False):
+    """Yield line prefixes without ever allocating a complete giant log line.
+    With ends=True, also yield whether the physical line ended with a newline."""
     with open_regular(path, os.O_RDONLY, "r") as stream:
         while True:
             line = stream.readline(limit + 1)
             if not line:
                 break
-            truncated = len(line) > limit and not line.endswith("\n")
+            ended = line.endswith("\n")
+            truncated = len(line) > limit and not ended
             if truncated:
-                while line and not line.endswith("\n"):
+                while True:
                     tail = stream.readline(65536)
                     if not tail or tail.endswith("\n"):
+                        ended = bool(tail)
                         break
-            yield line[:limit].rstrip("\r\n"), truncated
+            text = line[:limit].rstrip("\r\n")
+            yield (text, truncated, ended) if ends else (text, truncated)
 
 
 def text_excerpt(path: Path, max_lines: int, max_chars: int) -> str:
@@ -270,6 +466,186 @@ def text_excerpt(path: Path, max_lines: int, max_chars: int) -> str:
         result.append(line + (" [line truncated]" if truncated else ""))
         used += len(result[-1]) + 1
     return "\n".join(result)
+
+
+def text_usage(path: Path):
+    """Return (lines, characters) of a text file, reading it in bounded chunks."""
+    lines = chars = 0
+    last = ""
+    with open_regular(path, os.O_RDONLY, "r") as stream:
+        while chunk := stream.read(65536):
+            chars += len(chunk)
+            lines += chunk.count("\n")
+            last = chunk[-1]
+    return lines + (1 if last and last != "\n" else 0), chars
+
+
+def text_chars(path: Path) -> int:
+    """Count characters, not bytes, so check agrees with text_excerpt (CJK is 3 bytes/char)."""
+    return text_usage(path)[1]
+
+
+def cap_usage(path: Path, line_cap: int, char_cap: int):
+    """(fraction of the tighter cap, lines, characters)."""
+    lines, chars = text_usage(path)
+    return max(lines / line_cap, chars / char_cap), lines, chars
+
+
+def feature_modules() -> list:
+    """Built-in feature modules, then loaded project plugins, as entries (module, origin, label)."""
+    builtin = [SimpleNamespace(module=m, origin="built-in", label=m.__name__) for m in FEATURE_MODULES]
+    return builtin + PLUGINS
+
+
+def record_broken(entry, message: str) -> None:
+    BROKEN_MODULES.setdefault(entry.label, {"origin": entry.origin, "error": clipped(message, 600)})
+
+
+def call_hook(entry, hook: str, *args, default=None):
+    """Run one module hook; a failure is recorded for doctor/check and never breaks the command."""
+    function = getattr(entry.module, hook, None)
+    if not callable(function):
+        return default
+    try:
+        return function(*args)
+    except Exception as exc:  # WHY: module bugs must not break the core read path.
+        record_broken(entry, f"{hook} failed: {type(exc).__name__}: {exc}")
+        return default
+
+
+def module_table() -> dict:
+    """Event kinds, extra string fields and validators declared by feature modules (cached)."""
+    global _MODULE_TABLE
+    if _MODULE_TABLE is None:
+        table = {"kinds": set(CORE_EVENT_KINDS), "string_fields": [], "validators": []}
+        for entry in feature_modules():
+            kinds = getattr(entry.module, "EVENT_KINDS", set())
+            fields = getattr(entry.module, "EVENT_STRING_FIELDS", set())
+            if not all(isinstance(group, (set, frozenset, list, tuple)) and all(isinstance(x, str) for x in group)
+                       for group in (kinds, fields)):
+                record_broken(entry, "EVENT_KINDS and EVENT_STRING_FIELDS must be collections of strings")
+                continue
+            table["kinds"].update(kinds)
+            table["string_fields"] += [name for name in sorted(fields) if name not in table["string_fields"]]
+            if callable(getattr(entry.module, "validate_event", None)):
+                table["validators"].append(entry)
+        _MODULE_TABLE = table
+    return _MODULE_TABLE
+
+
+def plugin_source(path: Path):
+    """(source bytes, '') of a plugin file opened without following links, or (None, why it is skipped).
+    The bytes that were checked are the bytes that run."""
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_NONBLOCK)
+    except OSError as exc:
+        return None, f"cannot open it ({exc.strerror})"
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            return None, "a plugin must be a regular file named like my_feature.py"
+        problem = foreign_reason(info, strict=True)
+        if problem:
+            return None, f"{problem}; a plugin runs as you, so only you may be able to change it (chmod go-w)"
+        return stream.read(), ""
+
+
+def load_plugins(hub: Path) -> None:
+    """Import <hub>/bin/plugins/*.py after the built-in modules; skip and record broken or unsafe ones.
+    A plugin runs with the caller's permissions, so the hub, bin/, bin/plugins/ and the file itself must be
+    owned by this user (or root) and not writable by its group or other users."""
+    global _MODULE_TABLE
+    directory = hub / "bin" / "plugins"
+    if directory.is_symlink() or not directory.is_dir():
+        return
+    try:
+        for place in (hub, hub / "bin", directory):
+            problem = foreign_reason(os.stat(place), strict=True)
+            if problem:
+                BROKEN_MODULES["plugins/"] = {"origin": "plugin", "error": f"no plugin loaded: {place}: {problem}; "
+                                              "plugins run as you, so make it yours and not writable by others"}
+                return
+        paths = sorted(directory.iterdir())
+    except OSError as exc:
+        BROKEN_MODULES["plugins/"] = {"origin": "plugin", "error": f"cannot list plugins: {exc}"}
+        return
+    for path in paths:
+        if path.suffix != ".py" or path.name.startswith(("_", ".")):
+            continue
+        entry = SimpleNamespace(module=None, origin="plugin", label="plugins/" + path.name)
+        if not PLUGIN_FILE.fullmatch(path.name) or path.is_symlink() or not path.is_file():
+            record_broken(entry, "skipped: a plugin must be a regular file named like my_feature.py")
+            continue
+        source, problem = plugin_source(path)
+        if problem:
+            record_broken(entry, "skipped: " + problem)
+            continue
+        try:
+            spec = importlib.util.spec_from_loader(f"rmem_plugin_{path.stem}", loader=None, origin=str(path))
+            module = importlib.util.module_from_spec(spec)
+            module.__file__ = str(path)
+            exec(compile(source, str(path), "exec"), module.__dict__)
+        except (Exception, SystemExit) as exc:
+            record_broken(entry, f"skipped: import failed: {type(exc).__name__}: {exc}")
+            continue
+        entry.module = module
+        PLUGINS.append(entry)
+    _MODULE_TABLE = None
+
+
+def plugin_hub(argv):
+    """The validated hub whose plugins this command may load, or None: never with RMEM_NO_PLUGINS, for
+    top-level --help, init or version, or for a hub that does not validate."""
+    if os.environ.get("RMEM_NO_PLUGINS"):
+        return None
+    tokens = iter(argv)
+    word = None
+    for token in tokens:
+        if token in ("--agent", "--session"):
+            next(tokens, None)
+        elif not token.startswith(("--agent=", "--session=")):
+            word = None if token.startswith("-") else token
+            break
+    if word in (None, "init", "version"):
+        return None
+    try:
+        return validate_hub(discover_hub()[0])
+    except (RmemError, OSError, UnicodeError, ValueError):
+        return None  # no hub yet, or a hub problem that the command itself reports
+
+
+def section_lines(ctx, hook: str) -> list:
+    """Bounded extra lines from every module's status_sections/resume_sections hook."""
+    lines = []
+    for entry in feature_modules():
+        result = call_hook(entry, hook, ctx, default=[])
+        if not isinstance(result, (list, tuple)):
+            record_broken(entry, f"{hook} returned {type(result).__name__}, not a list of lines")
+            continue
+        lines += [clipped(line, 600) for line in result[:SECTION_MAX_LINES]]
+        if len(result) > SECTION_MAX_LINES:
+            lines.append(f"[{entry.label}: {len(result) - SECTION_MAX_LINES} more lines omitted]")
+    return lines
+
+
+def module_problems(ctx) -> list:
+    """(level, message) pairs from every module's check_problems hook, plus broken-module reports."""
+    problems = []
+    for entry in feature_modules():
+        result = call_hook(entry, "check_problems", ctx, default=[])
+        if not isinstance(result, (list, tuple)):
+            record_broken(entry, f"check_problems returned {type(result).__name__}, not a list")
+            continue
+        for item in result[:100]:
+            if (isinstance(item, (list, tuple)) and len(item) == 2 and item[0] in ("fail", "warn", "info")
+                    and isinstance(item[1], str)):
+                problems.append((item[0], f"{entry.label}: {item[1]}"))
+            else:
+                record_broken(entry, "check_problems items must be (level, message) with level fail, warn or info")
+    for label, broken in sorted(BROKEN_MODULES.items()):
+        level = "warn" if broken["origin"] == "plugin" else "fail"
+        problems.append((level, f"{broken['origin']} module {label} is not working: {broken['error']}"))
+    return problems
 
 
 def event_problem(event) -> str:
@@ -284,9 +660,8 @@ def event_problem(event) -> str:
             return "event timestamp requires a timezone"
     except ValueError:
         return "invalid event timestamp"
-    for name in ("agent", "session", "id", "thread", "status", "note", "commit", "log",
-                 "source_id", "source_namespace", "run_id", "host", "scheduler", "job_id",
-                 "event_id", "event_time", "supersedes"):
+    table = module_table()
+    for name in (*CORE_STRING_FIELDS, *table["string_fields"]):
         if event.get(name) is not None and not isinstance(event[name], str):
             return f"event {name} must be a string"
     metrics = event.get("metrics")
@@ -304,7 +679,7 @@ def event_problem(event) -> str:
                 or not re.fullmatch(r"[0-9a-f]{64}", str(source.get("sha256", "")))
                 for source in event["sources"]):
             return "invalid source evidence records"
-    for name in ("argv", "artifacts"):
+    for name in ("argv", "artifacts", "redacted"):
         if name in event and (not isinstance(event[name], list) or
                               any(not isinstance(value, str) for value in event[name])):
             return f"event {name} must be a list of strings"
@@ -333,18 +708,28 @@ def event_problem(event) -> str:
             return "event id must match research experiment_id"
         if not event.get("thread") or not event.get("session"):
             return "research record requires an event thread and session"
+    for entry in table["validators"]:
+        problem = call_hook(entry, "validate_event", event, default="")
+        if isinstance(problem, str) and problem:
+            return problem
+        if problem not in ("", None):
+            record_broken(entry, f"validate_event returned {type(problem).__name__}, not a string")
     return ""
 
 
 def events_locked(hub: Path):
-    for number, (line, truncated) in enumerate(bounded_lines(safe_path(hub, "ledger.jsonl"), EVENT_MAX_CHARS), 1):
+    unlocked = hub in UNLOCKED_HUBS
+    lines = bounded_lines(safe_path(hub, "ledger.jsonl"), EVENT_MAX_CHARS, ends=True)
+    for number, (line, truncated, ended) in enumerate(lines, 1):
+        if unlocked and not ended:
+            break  # WHY: without the lock an unterminated final line is an append in progress, not corruption.
         if not line.strip() and not truncated:
             continue
         try:
             event = json.loads(line) if not truncated else None
             problem = "event exceeds size limit" if truncated else event_problem(event)
         except (json.JSONDecodeError, RecursionError):
-            event, problem = None, "invalid JSON"
+            event, problem = None, research_git.marker_problem(line) or "invalid JSON"
         if problem:
             yield {"ts": "?", "kind": "CORRUPT", "note": f"line {number}: {problem}"}
         else:
@@ -354,17 +739,26 @@ def events_locked(hub: Path):
 def append_locked(hub: Path, event: dict) -> dict:
     # Caller holds the hub lock: assign the next step without rewriting legacy
     # rows, whose ledger position supplies their historical step number.
-    total, maximum, event_ids = 0, 0, set()
+    # The harness ID and CLAUDE_EFFORT are recorded on every event; a session bound to
+    # another conversation is refused here, the last guard for every ledger writer.
+    fields = identity.process_fields()
+    session, harness_id = event.get("session"), event.get("harness_session", fields.get("harness_session"))
+    total, maximum, event_ids, bound = 0, 0, set(), None
     for previous in events_locked(hub):
         total += 1
         maximum = max(maximum, previous.get("sequence", 0))
         if previous.get("event_id"):
             event_ids.add(previous["event_id"])
+        if harness_id and session and previous.get("session") == session:
+            bound = identity.next_binding(bound, previous)
+    fork = identity.fork_problem(session, harness_id, bound)
+    if fork:
+        raise RmemError(fork)
     event_id = uuid.uuid4().hex
     while event_id in event_ids:
         event_id = uuid.uuid4().hex
     event = {"ts": now(),
-             "host": socket.gethostname(), **event,
+             "host": socket.gethostname(), **fields, **event,
              "event_id": event_id, "sequence": max(total, maximum) + 1,
              "recorded_host": socket.gethostname(), "cwd": str(Path.cwd())}
     problem = event_problem(event)
@@ -380,9 +774,15 @@ def append_locked(hub: Path, event: dict) -> dict:
     return event
 
 
-def fmt_event(event: dict) -> str:
-    bits = [event.get("ts", "?")[:19], clipped(event.get("agent", "?"), 80), event["kind"]]
-    for name in ("id", "thread", "status", "job_id"):
+def fmt_event(event: dict, config=None) -> str:
+    stamp = display_time(event.get("ts", "?"), config)
+    if type(event.get("sequence")) is int:
+        stamp += f" #{event['sequence']}"
+    who = clipped(event.get("agent", "?"), 80)
+    if event.get("session"):
+        who += " s=" + clipped(event["session"], 128)
+    bits = [stamp, who, event["kind"]]
+    for name in ("id", "thread", "resource", "to", "status", "job_id"):
         if event.get(name):
             bits.append(f"{name}={clipped(event[name], 100)}")
     if event.get("metrics"):
@@ -424,42 +824,202 @@ def load_claim(hub: Path, slug: str):
     return record, ""
 
 
-def require_claim(hub: Path, slug: str, who: dict):
-    consistency_preflight(hub)
+def lease_entries(hub: Path) -> list:
+    """[(key, metadata, problem)] for every claims/ entry: thread slugs and '@NAME' resource leases."""
+    entries = []
+    for directory in claim_directories(hub):
+        if directory.name == ".gitkeep":
+            continue
+        name = directory.name
+        try:
+            identifier(name[len(RESOURCE_PREFIX):] if name.startswith(RESOURCE_PREFIX) else name)
+            metadata, problem = load_claim(hub, name)
+        except (RmemError, argparse.ArgumentTypeError) as error:
+            metadata, problem = None, str(error)
+        entries.append((name, metadata, problem))
+    return entries
+
+
+def lease_status(meta: dict, events, config: dict, activity=None, key=None) -> dict:
+    """Liveness of one lease: live while the holder's activity since the claim has no gap longer than its TTL
+    (sticky: a later event does not revive an expired lease). `key` (the thread slug) lets the holder's
+    own run on that thread count as continuous activity.
+    Keys: ttl_hours, since, last_activity, expires_at (aware datetimes) and live."""
+    activity = session_activity(events) if activity is None else activity
+    return lease_state(meta, activity, config["leases"]["default_ttl_hours"], dt.datetime.now(dt.timezone.utc), key)
+
+
+def held_leases(hub: Path, who: dict, events, config: dict) -> list:
+    """[(key, metadata, lease)] for the valid thread and resource leases this session and agent hold."""
+    activity = session_activity(events)
+    return [(key, meta, lease_status(meta, events, config, activity, key))
+            for key, meta, problem in lease_entries(hub) if meta and not problem and same_owner(meta, who)]
+
+
+def hours_text(hours: float) -> str:
+    return f"{max(1, round(hours * 60))} min" if hours < 1 else f"{hours:.1f} h"
+
+
+def lease_label(key: str) -> str:
+    return f"resource '{key[len(RESOURCE_PREFIX):]}'" if key.startswith(RESOURCE_PREFIX) else f"thread '{key}'"
+
+
+def lease_argument(key: str) -> str:
+    return f"--resource {key[len(RESOURCE_PREFIX):]}" if key.startswith(RESOURCE_PREFIX) else key
+
+
+def lease_details(lease: dict, config: dict) -> str:
+    """'last activity T, lease Nh, expires T' (or 'expired N h ago')."""
+    when = display_time(lease["last_activity"].isoformat(), config)
+    if lease["live"]:
+        end = f"expires {display_time(lease['expires_at'].isoformat(), config)}"
+    else:
+        end = f"expired {hours_text((dt.datetime.now(dt.timezone.utc) - lease['expires_at']).total_seconds() / 3600)} ago"
+    return f"last activity {when}, lease {lease['ttl_hours']:g}h, {end}{later_activity(lease, config, '; ')}"
+
+
+def later_activity(lease: dict, config: dict, separator: str) -> str:
+    """Note the holder's activity after a lapsed lease (a lapse is sticky; the holder renews by claiming again)."""
+    later = lease.get("holder_last_activity")
+    if lease["live"] or later is None or later <= lease["last_activity"]:
+        return ""
+    return f"{separator}holder last active {display_time(later.isoformat(), config)} (claim again to renew)"
+
+
+def lease_holder(meta: dict, lease: dict, config: dict) -> str:
+    """'agent / session (last activity T, lease Nh, expires T)' for messages about another session's lease."""
+    return f"{clipped(meta['agent'], 80)} / {clipped(meta['session'], 128)} ({lease_details(lease, config)})"
+
+
+WRITE_PURPOSES = ("log", "run", "highlight", "request")
+
+
+def thread_known(hub: Path, slug: str, events) -> bool:
+    # WHY: project-state is the protocol's own thread (highlights, shared files), so it is never a typo.
+    return (slug == "project-state" or safe_path(hub, "threads", f"{slug}.md").exists()
+            or safe_path(hub, "claims", slug).exists()
+            or any(event.get("thread") == slug for event in events))
+
+
+def event_time(value):
+    try:
+        moment = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return moment if moment.tzinfo else None
+
+
+def own_earlier_run(events, who: dict, slug: str, experiment_id, claimed_at) -> bool:
+    """Whether this session started a run with this experiment ID on the thread before the current lease
+    was claimed: it may record that run's outcome even under another session's lease."""
+    claimed = event_time(claimed_at)
+    for event in events:
+        if (event.get("kind") == "run_started" and event.get("thread") == slug and event.get("id") == experiment_id
+                and same_owner(event, who)):
+            started = event_time(event.get("ts"))
+            if started and claimed and started <= claimed:
+                return True
+    return False
+
+
+def authorize_thread_write(hub: Path, slug: str, who: dict, purpose: str, event_id=None):
+    """The one place that decides whether this session may write to a thread. Caller holds the hub lock.
+    No claim is needed: a write is refused only while ANOTHER session holds a live lease on the thread,
+    and a request is never refused by a lease. A session may still record the outcome of its own run
+    (an event whose ID is that run's ID) when the lease was claimed after the run started.
+    Returns this session's lease metadata, or None."""
+    if purpose not in WRITE_PURPOSES:
+        raise RmemError(f"unknown thread-write purpose {purpose!r}")
+    events = list(events_locked(hub))
+    consistency_preflight(hub, events=events, who=who)
+    if purpose == "request":
+        return None
     meta, problem = load_claim(hub, slug)
+    if meta is None:
+        if not thread_known(hub, slug, events):
+            raise RmemError(f"thread '{slug}' does not exist (no threads/{slug}.md and no ledger events); check the slug, "
+                            f"or create it with `rmem claim {slug}` and release it if you need no lease")
+        return None
     if problem:
-        raise RmemError(f"thread '{slug}': {problem}; claim it before writing or running")
-    if (meta["session"], meta["agent"]) != (who["session"], who["agent"]):
-        raise RmemError(f"thread '{slug}' belongs to session {clipped(meta['session'])}, not this session")
-    return meta
+        raise RmemError(f"thread '{slug}': {problem}; run `rmem check`, then recover it with "
+                        f"`rmem claim {slug} --force --reason TEXT`")
+    config = config_report(hub)[0]
+    lease = lease_status(meta, events, config, key=slug)
+    if same_owner(meta, who):
+        if not lease["live"]:
+            # WHY: expiry is sticky, so tell the holder instead of letting it believe it still holds the thread.
+            others = sorted({e.get("session") for e in events if e.get("thread") == slug and isinstance(e.get("session"), str)
+                             and e.get("session") != who.get("session") and (event_time(e.get("ts")) or lease["expires_at"])
+                             > lease["expires_at"]})
+            print(f"rmem: warning: your lease on thread '{slug}' expired at "
+                  f"{display_time(lease['expires_at'].isoformat(), config)}"
+                  + (f"; since then {', '.join(clipped(s, 80) for s in others[:5])} wrote to it" if others else "")
+                  + f". Re-read the thread, and run `rmem claim {slug}` to hold it again", file=sys.stderr)
+        return meta
+    if lease["live"]:
+        if event_id and own_earlier_run(events, who, slug, event_id, meta.get("ts")):
+            print(f"rmem: note: thread '{slug}' is leased by {clipped(meta['session'])}, but {event_id} is this "
+                  "session's own run started before that lease, so its outcome is recorded", file=sys.stderr)
+            return None
+        raise RmemError(f"thread '{slug}' belongs to session {clipped(meta['session'])} ({clipped(meta['agent'], 80)}) "
+                        f"under a live lease: {lease_details(lease, config)}. Write to another thread, send that session a request, "
+                        f"or wait with `rmem claim {slug} --wait SECONDS`")
+    return None
+
+
+def describe_owner(ctx, slug: str) -> str:
+    """Ownership text for the status thread list; also takes '@NAME' resource keys."""
+    try:
+        meta, problem = load_claim(ctx.hub, slug)
+    except RmemError as exc:
+        return "INVALID: " + str(exc)
+    if meta is None:
+        return "free"
+    if problem:
+        return "INVALID: " + problem
+    config = getattr(ctx, "config", None) or rmem_config.defaults()
+    activity = getattr(ctx, "lease_activity", None)
+    if activity is None:
+        activity = session_activity(getattr(ctx, "events", None) or [])
+        try:
+            ctx.lease_activity = activity  # WHY: status asks once per thread; scan the ledger once.
+        except AttributeError:
+            pass
+    lease = lease_status(meta, (), config, activity, slug)
+    text = (f"{meta['agent']} / {meta['session']} since {display_time(meta['ts'], config)} · last activity "
+            f"{display_time(lease['last_activity'].isoformat(), config)} · lease {lease['ttl_hours']:g}h")
+    if not lease["live"]:
+        age = (dt.datetime.now(dt.timezone.utc) - lease["expires_at"]).total_seconds() / 3600
+        text += f" (expired {hours_text(age)} ago; takeover with --takeover --reason)" + later_activity(lease, config, " · ")
+    return text
+
+
+def thread_visible(ctx, slug: str) -> bool:
+    """Whether status lists this thread: sealed and archived threads are hidden unless `status --all`."""
+    return bool(getattr(getattr(ctx, "args", None), "all", False)) or lifecycle.visible(ctx, slug)
 
 
 def consistency_snapshot(hub: Path, events=None):
     events = list(events_locked(hub)) if events is None else events
-    disk = {}
-    for directory in safe_path(hub, "claims").iterdir():
-        if directory.name == ".gitkeep":
-            continue
-        try:
-            identifier(directory.name)
-            metadata, problem = load_claim(hub, directory.name)
-        except (RmemError, argparse.ArgumentTypeError) as error:
-            metadata, problem = None, str(error)
-        disk[directory.name] = {"metadata": metadata, "problem": problem}
+    disk = {key: {"metadata": metadata, "problem": problem} for key, metadata, problem in lease_entries(hub)}
     return claim_issues(events, disk), ownership_history(events)
 
 
-def consistency_preflight(hub: Path, recovery=False):
-    """Caller holds hub lock. Force recovery only bypasses claim mismatches."""
-    events = list(events_locked(hub))
+def consistency_preflight(hub: Path, recovery=False, events=None, who=None):
+    """Caller holds hub lock. Force recovery only bypasses claim mismatches. With `who`, a session
+    bound to another conversation (a probable fork) is refused before any side effect."""
+    events = list(events_locked(hub)) if events is None else events
     identities = set()
     for event in events:
         if event["kind"] == "CORRUPT":
-            raise RmemError("ledger is corrupt; run check and recover history before mutation")
+            raise RmemError(f"ledger is corrupt ({clipped(event['note'], 300)}); run check and recover history before mutation")
         if event.get("event_id"):
             if event["event_id"] in identities:
                 raise RmemError("duplicate ledger event_id; run check before mutation")
             identities.add(event["event_id"])
+    fork = identity.current_fork(events, who.get("session")) if who else ""
+    if fork:
+        raise RmemError(fork)
     issues, states = consistency_snapshot(hub, events)
     if issues and not recovery:
         first = issues[0]
@@ -475,24 +1035,33 @@ def recovery_metadata(issues, states, slug):
 
 
 def force_reason(a):
-    if a.force and not a.reason:
-        raise RmemError("--force requires --reason describing the explicit recovery decision")
+    takeover = getattr(a, "takeover", False)
+    if a.force and takeover:
+        raise RmemError("use either --takeover (an expired lease) or --force (an inspected recovery), not both")
+    if (a.force or takeover) and not a.reason:
+        raise RmemError(("--force" if a.force else "--takeover") + " requires --reason describing the decision")
     if a.reason:
         one_line(a.reason, "reason")
-    if a.reason and not a.force:
-        raise RmemError("--reason is only used with --force")
+    if a.reason and not (a.force or takeover):
+        raise RmemError("--reason is only used with --force or --takeover")
 
 
-def active_runs(hub: Path, slug: str) -> set:
-    active = set()
-    for event in events_locked(hub):
+def unfinished_runs(hub: Path, slug: str, events=None) -> dict:
+    """run_id -> run_started event for the runs on a thread that have no terminal run event."""
+    active = {}
+    for event in events_locked(hub) if events is None else events:
         if event.get("thread") != slug or not event.get("run_id"):
             continue
         if event["kind"] == "run_started":
-            active.add(event["run_id"])
+            active[event["run_id"]] = event
         elif event["kind"] == "run":
-            active.discard(event["run_id"])
+            active.pop(event["run_id"], None)
     return active
+
+
+def active_runs(hub: Path, slug: str, events=None, who=None) -> set:
+    """Unfinished run IDs on a thread; with `who`, only the runs that session started."""
+    return {run for run, event in unfinished_runs(hub, slug, events).items() if who is None or same_owner(event, who)}
 
 
 THREAD_TEMPLATE = """# Thread: {slug}
@@ -512,106 +1081,275 @@ THREAD_TEMPLATE = """# Thread: {slug}
 ## Dead ends
 (What was tried and why it failed.)
 """
+WAIT_POLL_SECONDS = 0.5
+
+
+def lease_hours(value: str) -> float:
+    try:
+        hours = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected a number of hours, such as 2 or 0.5") from exc
+    if not (math.isfinite(hours) and 0 < hours <= 8760):
+        raise argparse.ArgumentTypeError("expected a number of hours greater than 0 and at most 8760")
+    return hours
+
+
+def wait_seconds(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected a number of seconds, such as 600") from exc
+    if not (math.isfinite(seconds) and 0 <= seconds <= 86400):
+        raise argparse.ArgumentTypeError("expected a number of seconds from 0 to 86400")
+    return seconds
+
+
+def lease_target(a):
+    """(key, thread slug or None, resource name or None) for `claim|release [SLUG] [--resource NAME]`."""
+    if bool(a.slug) == bool(a.resource):
+        raise RmemError("name one thread SLUG or one --resource NAME")
+    return (a.slug, a.slug, None) if a.slug else (RESOURCE_PREFIX + a.resource, None, a.resource)
+
+
+def claim_locked(hub: Path, who: dict, a, key: str, config: dict):
+    """One claim attempt under the hub lock. Returns the success message, or (metadata, lease)
+    while another session holds a live lease that --wait may outlast."""
+    slug, resource = (None, key[len(RESOURCE_PREFIX):]) if key.startswith(RESOURCE_PREFIX) else (key, None)
+    label = lease_label(key)
+    events = list(events_locked(hub))
+    issues, states = consistency_preflight(hub, recovery=a.force, events=events, who=who)
+    directory = safe_path(hub, "claims", key)
+    previous, problem = load_claim(hub, key)
+    ttl, takeover = a.ttl, None
+    if previous is not None or directory.exists():
+        lease = lease_status(previous, events, config, key=key) if previous and not problem else None
+        if lease and same_owner(previous, who) and not a.force:
+            ttl = ttl or lease["ttl_hours"]
+            if lease["live"] and ttl == lease["ttl_hours"]:
+                return (f"already held by this session: {label} (lease {ttl:g}h, last activity "
+                        f"{display_time(lease['last_activity'].isoformat(), config)})")
+            # An expired lease or a new --ttl is renewed below with a new claim event by the same owner.
+        elif not a.force:
+            if lease is None:
+                raise RmemError(f"{label} is claimed: {problem}; run `rmem check`, then recover it with "
+                                f"`rmem claim {lease_argument(key)} --force --reason TEXT`")
+            if lease["live"]:
+                if a.takeover and not a.wait:
+                    running = " (an unfinished run of the holder on it keeps the lease live)" if (
+                        slug and active_runs(hub, slug, events, previous)) else ""
+                    raise RmemError(f"{label} is held by {lease_holder(previous, lease, config)}{running}; --takeover "
+                                    "applies only to an expired lease. Wait with --wait SECONDS, or use --force --reason "
+                                    "after confirming with that session or the user that it stopped")
+                return previous, lease
+            if not a.takeover:
+                raise RmemError(f"{label} is held by {lease_holder(previous, lease, config)}. After checking that "
+                                f"session's jobs, take it over with `rmem claim {lease_argument(key)} --takeover --reason TEXT`")
+            if slug and active_runs(hub, slug, events):
+                raise RmemError(f"{label} has an unfinished run; verify the process or job, then recover with --force --reason")
+            takeover = lease
+    ttl = ttl or config["leases"]["default_ttl_hours"]
+    foreign = [event for event in (unfinished_runs(hub, slug, events) if slug else {}).values() if not same_owner(event, who)]
+    for event in foreign[:3]:
+        # WHY: not a refusal, because a killed run never finishes; that session can still log its own run's outcome.
+        print(f"rmem: warning: {label} has an unfinished run {clipped(event.get('id', '?'), 80)} started by "
+              f"{clipped(event.get('session', '?'), 128)} at {display_time(event.get('ts'), config)}; that session can "
+              f"still record its outcome (`rmem log --id {clipped(event.get('id', 'ID'), 80)}`) under your lease. "
+              "Verify the process before relying on the thread", file=sys.stderr)
+    thread = safe_path(hub, "threads", f"{slug}.md") if slug else None
+    if not directory.exists():
+        directory.mkdir()
+    if thread and not thread.exists():
+        atomic_write(thread, THREAD_TEMPLATE.format(slug=slug))
+    event = {**who, "kind": "claim", **({"thread": slug} if slug else {"resource": resource}), "note": a.note,
+             "claim_metadata_version": 1, "lease_ttl_hours": ttl}
+    if a.force:
+        event.update(previous_owner=previous, previous_owner_problem=problem, reason=a.reason,
+                     consistency_recovery=recovery_metadata(issues, states, key))
+    elif takeover:
+        # previous_owner + reason make research_consistency treat this like a forced recovery.
+        event.update(previous_owner=previous, reason=a.reason, takeover=True,
+                     previous_last_activity=takeover["last_activity"].isoformat(),
+                     previous_lease_expired_at=takeover["expires_at"].isoformat())
+    recorded = append_locked(hub, event)
+    metadata = {**who, "ts": recorded["ts"], "host": socket.gethostname(), "pid": os.getpid(),
+                "note": a.note or "", "claim_event_id": recorded["event_id"], "lease_ttl_hours": ttl}
+    atomic_write(safe_path(hub, "claims", key, "meta.json"), json.dumps(metadata, ensure_ascii=False) + "\n")
+    verb = "took over" if takeover else "claimed"
+    where = f" → {thread}" if thread else " (outside the hub)"
+    return f"{verb} {label} for session {who['session']} (lease {ttl:g}h, renewed by any event of this session){where}"
+
+
+def wait_for_lease_change(hub: Path, key: str, meta: dict, lease: dict, seconds: float) -> None:
+    """Sleep until claims/<key>/meta.json changes, the lease may have expired, or the time is up.
+    Only the small claim file is polled, without the hub lock; the ledger is read again afterwards."""
+    deadline = time.monotonic() + seconds
+    anchor = (meta.get("claim_event_id"), meta.get("ts"))
+    while time.monotonic() < deadline and dt.datetime.now(dt.timezone.utc) <= lease["expires_at"]:
+        try:
+            with open_regular(safe_path(hub, "claims", key, "meta.json"), os.O_RDONLY, "r") as stream:
+                current = json.loads(stream.read(8193))
+        except (OSError, ValueError, RmemError):
+            return
+        if not isinstance(current, dict) or (current.get("claim_event_id"), current.get("ts")) != anchor:
+            return
+        time.sleep(max(0.0, min(WAIT_POLL_SECONDS, deadline - time.monotonic())))
 
 
 def cmd_claim(a):
     hub, who = find_hub(), actor(a, required=True)
+    key = lease_target(a)[0]
     force_reason(a)
     if a.note is not None:
         one_line(a.note, "note")
-    with hub_lock(hub):
-        issues, states = consistency_preflight(hub, recovery=a.force)
-        directory = safe_path(hub, "claims", a.slug)
-        previous, problem = load_claim(hub, a.slug)
-        if previous is not None or directory.exists():
-            if not problem and (previous["session"], previous["agent"]) == (who["session"], who["agent"]) and not a.force:
-                print(f"already held by this session: {a.slug}")
-                return 0
-            if not a.force:
-                raise RmemError(f"thread '{a.slug}' is claimed: {problem or previous['session']}; choose another thread")
-        thread = safe_path(hub, "threads", f"{a.slug}.md")
-        if not directory.exists():
-            directory.mkdir()
-        if not thread.exists():
-            atomic_write(thread, THREAD_TEMPLATE.format(slug=a.slug))
-        event = {**who, "kind": "claim", "thread": a.slug, "note": a.note, "claim_metadata_version": 1}
-        if a.force:
-            event.update(previous_owner=previous, previous_owner_problem=problem, reason=a.reason,
-                         consistency_recovery=recovery_metadata(issues, states, a.slug))
-        recorded = append_locked(hub, event)
-        metadata = {**who, "ts": recorded["ts"], "host": socket.gethostname(), "pid": os.getpid(),
-                    "note": a.note or "", "claim_event_id": recorded["event_id"]}
-        atomic_write(safe_path(hub, "claims", a.slug, "meta.json"), json.dumps(metadata, ensure_ascii=False) + "\n")
-    print(f"claimed {a.slug} for session {who['session']} → {thread}")
-    return 0
+    if a.force and a.wait:
+        raise RmemError("--wait does not combine with --force; an inspected recovery does not wait")
+    config = load_config(hub)
+    warn_shared_identity(a)
+    started = time.monotonic()
+    while True:
+        with hub_lock(hub):
+            outcome = claim_locked(hub, who, a, key, config)
+        if isinstance(outcome, str):
+            if outcome.startswith("already held") and identity.session_is_derived(a):
+                outcome += ("\nThe session was derived from this conversation's ID; parallel subagents of this "
+                            "conversation derive the same one, so each of them needs its own --session ID.")
+            print(outcome)
+            return 0
+        meta, lease = outcome
+        remaining = (a.wait or 0) - (time.monotonic() - started)
+        if remaining <= 0:
+            waited = f" after waiting {a.wait:g} s" if a.wait else ""
+            raise RmemError(f"{lease_label(key)} is held by {lease_holder(meta, lease, config)}{waited}. Choose another "
+                            f"thread, wait with `rmem claim {lease_argument(key)} --wait SECONDS`, or send that session a request")
+        wait_for_lease_change(hub, key, meta, lease, remaining)
+
+
+def warn_shared_identity(a) -> None:
+    for warning in identity.shared_identity_warnings(a):
+        print("rmem: warning: " + warning, file=sys.stderr)
 
 
 def cmd_release(a):
     hub, who = find_hub(), actor(a, required=True)
+    key, slug, resource = lease_target(a)
+    label = lease_label(key)
     force_reason(a)
     if a.note is not None:
         one_line(a.note, "note")
+    warn_shared_identity(a)
     with hub_lock(hub):
-        issues, states = consistency_preflight(hub, recovery=a.force)
-        directory = safe_path(hub, "claims", a.slug)
+        events = list(events_locked(hub))
+        issues, states = consistency_preflight(hub, recovery=a.force, events=events, who=who)
+        directory = safe_path(hub, "claims", key)
         missing = not directory.exists()
-        if not directory.is_dir() and not (missing and a.force and states.get(a.slug, {}).get("active_claim")):
-            raise RmemError(f"no claim on '{a.slug}'")
-        previous, problem = load_claim(hub, a.slug)
+        if not directory.is_dir() and not (missing and a.force and states.get(key, {}).get("active_claim")):
+            raise RmemError(f"no lease on {label}")
+        previous, problem = load_claim(hub, key)
         if not a.force:
-            require_claim(hub, a.slug, who)
-            if active_runs(hub, a.slug):
-                raise RmemError("thread has an unfinished run; keep the claim, or use explicit recovery after checking the process")
+            if problem:
+                raise RmemError(f"{label}: {problem}; run `rmem check`, then recover it with "
+                                f"`rmem release {lease_argument(key)} --force --reason TEXT`")
+            if not same_owner(previous, who):
+                raise RmemError(f"{label} belongs to session {clipped(previous['session'])}, not this session; "
+                                f"an expired lease can be taken over with `rmem claim {lease_argument(key)} --takeover --reason TEXT`")
+            if slug and active_runs(hub, slug, events, who):
+                raise RmemError("this session has an unfinished run on the thread; keep the lease until it ends, or use "
+                                "explicit recovery (--force --reason) after checking the process")
         unexpected = [p.name for p in directory.iterdir() if p.name != "meta.json"] if not missing else []
         if unexpected:
             raise RmemError(f"refusing to delete unexpected claim contents: {clipped(unexpected)}")
-        meta = safe_path(hub, "claims", a.slug, "meta.json")
-        event = {**who, "kind": "release", "thread": a.slug, "note": a.note}
+        meta = safe_path(hub, "claims", key, "meta.json")
+        event = {**who, "kind": "release", **({"thread": slug} if slug else {"resource": resource}), "note": a.note}
         if a.force:
             event.update(previous_owner=previous, previous_owner_problem=problem, reason=a.reason,
-                         consistency_recovery=recovery_metadata(issues, states, a.slug))
+                         consistency_recovery=recovery_metadata(issues, states, key))
         append_locked(hub, event)
         meta.unlink(missing_ok=True)
         if not missing:
             directory.rmdir()
-    print(f"released {a.slug}")
+    print(f"released {label}")
     return 0
+
+
+def reader_identity(a) -> dict:
+    """Best-effort identity for read-only views; an invalid label never blocks reading."""
+    try:
+        return actor(a)
+    except RmemError:
+        return {}
+
+
+def context(hub: Path, events: list, config: dict, a):
+    """The ctx passed to module hooks; events were read under the lock, so modules must not reread."""
+    return SimpleNamespace(hub=hub, events=events, config=config, who=reader_identity(a), core=core, args=a)
+
+
+def usage_note(usage: float, soft_ratio: float) -> str:
+    if usage > 1:
+        return f"{usage:.0%} of cap (over the cap; check fails)"
+    if usage >= soft_ratio:
+        return f"{usage:.0%} of cap (above the {soft_ratio:.0%} soft target)"
+    return f"{usage:.0%}"
 
 
 def cmd_status(a):
     hub = find_hub()
-    out = Output()
-    with hub_lock(hub, shared=True):
-        out.add(f"# rmem hub: {hub}\n")
-        issues, _ = consistency_snapshot(hub)
+    config = load_config(hub)
+    caps = config["caps"]
+    # WHY: the thread is appended last, so give it its own budget instead of whatever STATE leaves.
+    out = Output(caps["output_max_chars"] + (caps["thread_max_chars"] if a.thread else 0))
+    with hub_lock(hub, shared=True, readonly_ok=True):
+        events = list(events_locked(hub))
+        ctx = context(hub, events, config, a)
+        out.add(f"# rmem hub: {hub} (kit {kit_version()})\n")
+        if BROKEN_MODULES:
+            out.add(f"Note: {len(BROKEN_MODULES)} feature module(s) or plugin(s) are not working; run `rmem doctor`.\n")
+        issues, _ = consistency_snapshot(hub, events)
         if issues:
             out.add("## Claim/ledger inconsistency — ordinary mutations are blocked")
             for issue in issues[:8]:
                 out.add(f"- {clipped(issue['thread'], 80)}: {clipped('; '.join(issue['problems']), 600)}")
             out.add("Inspect check/owner/jobs and intended Git history before explicit recovery.\n")
-        out.add(text_excerpt(safe_path(hub, "STATE.md"), STATE_MAX_LINES, STATE_MAX_CHARS))
-        out.add("\n## Threads")
+        extra = section_lines(ctx, "status_sections")
+        for line in extra:
+            out.add(line)
+        if extra:
+            out.add("")
+        state = safe_path(hub, "STATE.md")
+        usage, lines, chars = cap_usage(state, caps["state_max_lines"], caps["state_max_chars"])
+        out.add(f"Budget: STATE.md {chars:,} / {caps['state_max_chars']:,} characters, "
+                f"{lines} / {caps['state_max_lines']} lines ({usage_note(usage, caps['soft_ratio'])})")
+        out.add(text_excerpt(state, caps["state_max_lines"], caps["state_max_chars"]))
+        out.add(f"\n## Threads (share of the {caps['thread_max_chars']:,}-character / {caps['thread_max_lines']}-line cap)")
         threads = sorted(safe_path(hub, "threads").glob("*.md"))
+        listed = [thread for thread in threads if call_thread_visible(ctx, thread.stem)]
         if not threads:
             out.add("(none yet; `rmem claim SLUG` creates one)")
-        for thread in threads[:40]:
+        for thread in listed[:40]:
             try:
-                meta, problem = load_claim(hub, thread.stem)
-                owner = "free" if meta is None else ("INVALID: " + problem if problem else
-                        f"{meta['agent']} / {meta['session']} since {meta['ts'][:19]}")
-            except RmemError as exc:
-                owner = "INVALID: " + str(exc)
-            out.add(f"- {clipped(thread.stem, 80)}: {clipped(owner, 220)}")
-        if len(threads) > 40:
-            out.add(f"[thread list truncated: {len(threads)} total; select --thread]")
-        recent, unfinished = deque(maxlen=a.n), {}
-        for event in events_locked(hub):
+                share = usage_note(cap_usage(thread, caps["thread_max_lines"], caps["thread_max_chars"])[0],
+                                   caps["soft_ratio"])
+            except (OSError, RmemError) as exc:
+                share = "unreadable: " + clipped(exc, 120)
+            state = lifecycle.state_of(ctx, thread.stem)
+            out.add(f"- {clipped(thread.stem, 80)}: {clipped(describe_owner(ctx, thread.stem), 360)} · {share}"
+                    + ("" if state == "active" else f" · {state}"))
+        if len(listed) > 40:
+            out.add(f"[thread list truncated: {len(listed)} total; select --thread]")
+        if len(listed) < len(threads):
+            out.add(f"[{len(threads) - len(listed)} sealed or archived thread(s) hidden; "
+                    "`rmem status --all` lists them and --thread SLUG shows one]")
+        recent, unfinished, locks, appended = deque(maxlen=a.n), {}, 0, 0
+        for event in events:
             if event["kind"] == "run_started" and event.get("run_id"):
                 unfinished[event["run_id"]] = event
             elif event["kind"] == "run":
                 unfinished.pop(event.get("run_id"), None)
+            elif a.n and event["kind"] in queries.LOCK_KINDS and not a.include_locks:
+                locks += 1
             elif a.n:
-                recent.append(event)
+                recent.append((event, locks))
+                appended += 1
         if unfinished:
             out.add("\n## Unfinished attempts (completion unknown; verify the process/job)")
             for event in list(unfinished.values())[-10:]:
@@ -619,33 +1357,61 @@ def cmd_status(a):
                                         for name in ("id", "thread", "run_id", "log")))
             if len(unfinished) > 10:
                 out.add(f"[showing 10 of {len(unfinished)} unfinished attempts]")
-        out.add(f"\n## Last {len(recent)} ledger events")
-        for event in recent:
-            out.add("- " + fmt_event(event))
+        hidden = locks - recent[0][1] if appended > len(recent) else locks
+        out.add(f"\n## Last {len(recent)} ledger events" + (
+            f" ({hidden} claim/release events hidden; `rmem recent --include-locks` shows them)" if hidden else ""))
+        for event, _ in recent:
+            out.add("- " + fmt_event(event, config))
         if a.thread:
             thread = safe_path(hub, "threads", f"{a.thread}.md")
             out.add(f"\n## threads/{a.thread}.md")
-            out.add(text_excerpt(thread, THREAD_MAX_LINES, THREAD_MAX_CHARS) if thread.exists() else "(missing)")
+            out.add(text_excerpt(thread, caps["thread_max_lines"], caps["thread_max_chars"])
+                    if thread.exists() else "(missing)")
     out.emit()
     return 0
 
 
+def call_thread_visible(ctx, slug: str) -> bool:
+    try:
+        return bool(thread_visible(ctx, slug))
+    except Exception:  # WHY: a lifecycle bug must not hide threads silently or break status.
+        return True
+
+
 def cmd_recent(a):
     hub = find_hub()
-    recent = deque(maxlen=a.n)
-    if a.n:
-        with hub_lock(hub, shared=True):
-            for event in events_locked(hub):
-                if a.kind and event["kind"] != a.kind:
-                    continue
-                if a.thread and event.get("thread") != a.thread:
-                    continue
-                if a.grep and not a.grep.search(json.dumps(event, ensure_ascii=False)):
-                    continue
-                recent.append(event)
-    out = Output()
-    for event in recent:
-        out.add(fmt_event(event))
+    config = load_config(hub)
+    n, notice = queries.clamp(a.n, "events")
+    if not n:
+        return 0
+    since = parse_user_time(a.since, config) if a.since else None
+    until = parse_user_time(a.until, config) if a.until else None
+    if since and until and since > until:
+        raise RmemError("--since must not be after --until")
+    if a.after_seq is not None and a.after_pos is not None:
+        raise RmemError("give either --after-seq or --after-pos, not both")
+    mine = None
+    if a.other_sessions:
+        if a.from_session:
+            raise RmemError("--from-session selects one session's events and --other-sessions hides your own; use one")
+        mine = reader_identity(a).get("session")
+        if not mine:
+            raise RmemError("--other-sessions needs your session: pass --session ID, set RMEM_SESSION, or run inside "
+                            "Claude Code or Codex")
+    rule = queries.Selection(kinds=a.kind, thread=a.thread, session=a.from_session, exclude_session=mine,
+                             grep=a.grep, since=since, until=until, include_locks=a.include_locks)
+    forward = a.after_seq is not None or a.after_pos is not None
+    after = f"#{a.after_seq}" if a.after_seq is not None else f"line position {a.after_pos}"
+    with hub_lock(hub, shared=True, readonly_ok=True):
+        selection = queries.select_recent(events_locked(hub), rule, n, forward,
+                                          queries.Start(a.after_seq, a.after_pos))
+    cap = config["caps"]["output_max_chars"]
+    # WHY: fit whole lines and keep the notes; the far end of the window is dropped first.
+    lines = queries.recent_lines(selection, lambda event: fmt_event(event, config), max(cap - 800, cap // 2),
+                                 forward, after, notice)
+    out = Output(cap)
+    for line in lines:
+        out.add(line)
     out.emit()
     return 0
 
@@ -659,8 +1425,11 @@ def record_view(function, *args):
 
 def cmd_catalog(a):
     hub = find_hub()
-    with hub_lock(hub, shared=True):
+    a.n, notice = queries.clamp(a.n, "rows")
+    with hub_lock(hub, shared=True, readonly_ok=True):
         view = record_view(catalog_view, hub, list(events_locked(hub)), a)
+    if notice:
+        view["notice"] = notice
     # Views own their budgets; Output would truncate JSON mid-value.
     print(json.dumps(view, ensure_ascii=False, separators=(",", ":"), allow_nan=False))
     return 0
@@ -668,8 +1437,23 @@ def cmd_catalog(a):
 
 def cmd_show(a):
     hub = find_hub()
-    with hub_lock(hub, shared=True):
-        view = record_view(show_view, hub, list(events_locked(hub)), a.identifier, a.section)
+    if a.body and a.field not in (None, "body"):
+        raise RmemError("--body is short for --field body; give one field")
+    field = "body" if a.body else a.field
+    if field is None and (a.page is not None or a.page_size is not None or a.format == "text"):
+        raise RmemError("--page, --page-size and --format text read one field; add --field NAME "
+                        "(for example --field note, --field body or --field research)")
+    if field is not None and a.section is not None:
+        raise RmemError("--section and --field choose different views; give one of them")
+    with hub_lock(hub, shared=True, readonly_ok=True):
+        events = list(events_locked(hub))
+        if field is None:
+            view = record_view(show_view, hub, events, a.identifier, a.section or "all")
+        else:
+            view = record_view(queries.field_view, hub, events, a.identifier, field, a.page or 1, a.page_size)
+    if field is not None and a.format == "text":
+        sys.stdout.write(queries.field_text_output(view))
+        return 0
     print(json.dumps(view, ensure_ascii=False, separators=(",", ":"), allow_nan=False))
     return 0
 
@@ -677,19 +1461,33 @@ def cmd_show(a):
 def cmd_highlight(a):
     hub = find_hub()
     creating = a.highlight_command == "create"
+    writing = creating or (a.highlight_command == "index" and a.write)
     who = actor(a, required=creating)
-    with hub_lock(hub, shared=not creating):
+    # Restore writes a review copy elsewhere, so it keeps requiring the real shared lock.
+    with hub_lock(hub, shared=not writing, readonly_ok=a.highlight_command in ("list", "show", "verify", "index") and not writing):
         events = list(events_locked(hub))
         if creating:
-            require_claim(hub, "project-state", who)
-            receipt = highlights.freeze(hub, a.spec, who, events)
+            authorize_thread_write(hub, "project-state", who, "highlight")
+            receipt = highlights.freeze(hub, a.spec, who, events, freeze_ledger=a.freeze_ledger)
             event = append_locked(hub, {**who, "kind": "highlight_created", "thread": "project-state",
                                        "id": receipt["id"], "manifest_sha256": receipt["manifest_sha256"],
                                        "highlight_path": receipt["highlight_path"], "occurred_at": receipt["occurred_at"],
                                        "captured_at": receipt["captured_at"], "note": receipt["summary"]})
             result = {**receipt, "event_id": event["event_id"], "sequence": event["sequence"],
                       "limits": "Snapshot recorded; evidence status is preserved, not upgraded to scientific acceptance."}
+        elif a.highlight_command == "index":
+            text = highlights.index_text(hub, events)
+            if a.write:
+                atomic_write(safe_path(hub, highlights.INDEX_NAME), text)
+                print(f"wrote {highlights.INDEX_NAME} ({text.count(chr(10))} lines); commit it with the hub")
+            else:
+                sys.stdout.write(text)
+                print(f"\n(dry run: `rmem highlight index --write` saves this as {highlights.INDEX_NAME})")
+            return 0
         elif a.highlight_command == "list":
+            config = config_report(hub)[0]
+            a.since = parse_user_time(a.since, config) if a.since else None
+            a.until = parse_user_time(a.until, config) if a.until else None
             if a.since and a.until and a.since > a.until:
                 raise RmemError("--since must not be after --until")
             result = highlights.list_view(hub, events, a)
@@ -699,8 +1497,23 @@ def cmd_highlight(a):
             manifest = highlights.verify(hub, a.identifier, events)
             result = highlights.show_view(manifest, highlights.inventory(hub, events)) if a.highlight_command == "show" else {
                 "highlight_id": a.identifier, "verified": True, "file_count": len(manifest["files"]),
+                "ledger_storage": highlights.ledger_storage(manifest),
                 "history_verification": manifest.get("history_verification"),
                 "limits": "Frozen local bytes and anchor verified; inspect history_verification for the live-history relation. No remote availability or scientific acceptance implied."}
+            if a.highlight_command == "verify":
+                ignored = highlights.ignored_snapshot_files(hub, [a.identifier]).get(a.identifier)
+                if ignored:
+                    result["warnings"] = [highlights.ignored_warning(a.identifier, ignored)]
+    index = safe_path(hub, highlights.INDEX_NAME)
+    if creating and index.is_file():
+        # WHY: rebuilding the index verifies every highlight, so it runs under the shared lock (other writers
+        # wait only for the write itself); appends need the exclusive lock, so no event is missed.
+        try:  # an index that exists is kept current; a failure never undoes the recorded highlight.
+            with hub_lock(hub, shared=True):
+                atomic_write(index, highlights.index_text(hub, list(events_locked(hub))))
+            result["index"] = f"{highlights.INDEX_NAME} updated"
+        except (ValueError, OSError, RmemError) as exc:
+            result["index"] = f"{highlights.INDEX_NAME} not updated: {clipped(exc, 300)}"
     print(json.dumps(result, ensure_ascii=False, separators=(",", ":"), allow_nan=False))
     return 0
 
@@ -715,17 +1528,33 @@ def run_git(path: Path, *args, check: bool = True):
     return result
 
 
-def provenance(path: Path) -> dict:
+def provenance(path: Path, hub: Path = None) -> dict:
+    """Git state of the checkout at path. A hub inside that checkout is left out of dirty and the
+    status hash, so memory writes do not mark the code as changed."""
     if shutil.which("git") is None:
         return {"git": False, "git_error": "git executable unavailable", "captured_at": now()}
     root = run_git(path, "rev-parse", "--show-toplevel", check=False)
     if root.returncode:
         return {"git": False, "captured_at": now()}
+    repository = root.stdout.strip()
     head = run_git(path, "rev-parse", "--verify", "HEAD", check=False)
-    status_text = run_git(path, "status", "--porcelain=v1", "--untracked-files=all").stdout
-    return {"git": True, "repository": root.stdout.strip(), "commit": head.stdout.strip() or None,
-            "dirty": bool(status_text), "status_sha256": hashlib.sha256(status_text.encode()).hexdigest(),
-            "captured_at": now()}
+    arguments, excluded = ["status", "--porcelain=v1", "--untracked-files=all"], None
+    if hub is not None:
+        try:
+            excluded = Path(hub).resolve().relative_to(Path(repository).resolve()).as_posix()
+        except ValueError:
+            excluded = None  # the hub lives outside this checkout
+        if excluded and excluded != ".":
+            arguments += ["--", ":/", f":(top,exclude,literal){excluded}"]
+        else:
+            excluded = None
+    status_text = run_git(path, *arguments).stdout
+    result = {"git": True, "repository": repository, "commit": head.stdout.strip() or None,
+              "dirty": bool(status_text), "status_sha256": hashlib.sha256(status_text.encode()).hexdigest(),
+              "captured_at": now()}
+    if excluded:
+        result["dirty_excludes"] = [excluded]
+    return result
 
 
 def source_records(paths) -> list:
@@ -784,9 +1613,11 @@ def parse_metrics(values) -> dict:
 
 
 def import_fingerprint(event: dict) -> str:
+    # Fields added in 0.4.0 are absent from older imports, so their fingerprints are unchanged.
     fields = ("kind", "id", "thread", "status", "hyp", "metrics", "commit", "where", "note",
               "sources", "source_namespace", "source_id", "job_id", "scheduler", "artifacts", "evidence_level",
-              "event_time", "supersedes", "evidence_host", "research")
+              "event_time", "supersedes", "evidence_host", "research",
+              "body_sha256", "cmd", "cmd_sha256", "code_ref", "workdir", "fields")
     payload = {key: event[key] for key in fields if event.get(key) is not None}
     if "sources" in payload:
         # Locations belong to the preserved receipt, not evidence identity: a
@@ -799,16 +1630,23 @@ def import_fingerprint(event: dict) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
-def cmd_log(a):
-    if a.record and not a.thread:
-        raise RmemError("--record requires --thread and that session's claim")
-    hub, who = find_hub(), actor(a, required=bool(a.thread))
-    source_paths = list(a.source or [])
-    if a.record:
+def build_log_event(a, who: dict, config=None, hub=None) -> dict:
+    """Validate the arguments and assemble the event; no hub lock, no ledger access.
+    Returns a queries.Draft: note and command texts for notes/ ride along until the locked commit."""
+    get = lambda name: getattr(a, name, None)  # capture shares this path with fewer options
+    max_chars = (config or rmem_config.defaults())["notes"]["body_max_chars"]
+    if get("note") is not None:
+        record_view(queries.check_summary, a.note)
+    if get("record") and not get("thread"):
+        raise RmemError("--record requires --thread")
+    body = record_view(queries.read_text_input, a.note_file, "--note-file", max_chars) if get("note_file") else None
+    extra, texts = record_view(queries.provenance_fields, a, max_chars)
+    source_paths = list(get("source") or [])
+    if get("record"):
         source_paths.append(a.record)
     sources = source_records(source_paths)
     research = None
-    if a.record:
+    if get("record"):
         research = record_view(load_record_file, Path(a.record).expanduser())
         refreshed = source_records([a.record])[0]
         original = next(source for source in sources if source["path"] == refreshed["path"])
@@ -817,65 +1655,153 @@ def cmd_log(a):
         if a.id is not None and a.id != research["experiment_id"]:
             raise RmemError("--id must match the record's experiment_id")
         a.id = research["experiment_id"]
-    event = {**who, "kind": a.kind, **extra_metadata(a)}
+    kind = get("kind") or "exp"
+    event = {**who, "kind": kind, **extra_metadata(a)}
     if research is not None:
         event["research"] = research
     for name in ("id", "thread", "status", "hyp", "commit", "where", "note", "supersedes"):
-        value = getattr(a, name)
+        value = get(name)
         if value is not None:
             event[name] = one_line(value, name)
-    if a.event_time:
-        try:
-            timestamp = dt.datetime.fromisoformat(a.event_time.replace("Z", "+00:00"))
-        except ValueError as exc:
-            raise RmemError("--event-time must be an ISO 8601 timestamp with a timezone") from exc
-        if timestamp.tzinfo is None:
-            raise RmemError("--event-time must include a timezone")
-        event["event_time"] = timestamp.isoformat()
-    metrics = parse_metrics(a.metric)
+    if body is not None:
+        event.setdefault("note", queries.summary_from(body))
+        extra.update(queries.stored_fields("body", body))
+        texts["body"] = body
+    if get("event_time"):
+        event["event_time"] = original_time(a.event_time, config)
+    metrics = parse_metrics(get("metric"))
     if metrics:
         event["metrics"] = metrics
     if sources:
         event["sources"] = sources
-    if a.kind == "import":
-        if not a.source_namespace or not a.source_id or not sources:
+    event.update(extra)
+    if kind == "import":
+        if not get("source_namespace") or not get("source_id") or not sources:
             raise RmemError("imports require --source-namespace, --source-id and at least one --source local file")
         event.update(source_namespace=one_line(a.source_namespace, "source namespace", 200),
                      source_id=one_line(a.source_id, "source ID", 500))
         event["import_fingerprint"] = import_fingerprint(event)
-    elif a.source_namespace or a.source_id:
+    elif get("source_namespace") or get("source_id"):
         raise RmemError("--source-namespace and --source-id are only used with --kind import")
-    elif not a.commit:
-        code = provenance(Path.cwd())
+    elif not get("commit") and get("no_provenance"):
+        event["provenance"] = {"git": False, "skipped": True, "captured_at": now()}
+    elif not get("commit"):
+        code = provenance(Path.cwd(), hub)
         event["provenance"] = code
-        if code.get("commit"):
+        # WHY: with --code-ref the commit describes the code that ran elsewhere, not this checkout.
+        if code.get("commit") and "commit" not in event and not event.get("code_ref"):
             event.update(commit=code["commit"], dirty=code["dirty"])
+    draft = queries.Draft(event, texts)
+    if not get("allow_sensitive"):
+        refuse_sensitive(sensitive_fields(draft, draft.bodies))
+    preflight_event(draft)
+    return draft
+
+
+def sensitive_fields(event: dict, texts=None) -> list:
+    """Names of the event's text fields (and note or command texts) that look like a key, token or password."""
+    candidates = {name: event.get(name) for name in ("note", "hyp", "where", "cmd", "workdir", "code_ref", "supersedes")}
+    candidates["argv"] = "\n".join(event.get("argv") or [])
+    candidates.update({f"--set {key}": f"{key}={value}" for key, value in (event.get("fields") or {}).items()})
+    candidates.update({("--note-file" if name == "body" else "--cmd-file or long command"): text
+                       for name, text in (texts or {}).items()})
+    return [name for name, value in candidates.items() if isinstance(value, str) and highlights.SECRET_TEXT.search(value)]
+
+
+def refuse_sensitive(names) -> None:
+    if names:
+        raise RmemError(f"refusing to record text that looks like a key, token or password in {', '.join(names)} (the "
+                        "value is not printed). Ledger lines and committed notes cannot be redacted without rewriting "
+                        "history: refer to the secret by name instead (for example $HF_TOKEN), or pass "
+                        "--allow-sensitive if it is not a secret. Nothing was recorded")
+
+
+def preflight_event(event: dict) -> None:
+    """Run append_locked's checks before any lock, so a refused write leaves nothing behind."""
+    host = socket.gethostname()
+    probe = {"ts": now(), "host": host, **event, "event_id": "0" * 32, "sequence": 1,
+             "recorded_host": host, "cwd": str(Path.cwd())}
+    problem = event_problem(probe)
+    if problem:
+        raise RmemError(problem)
+    # WHY: leave room for fields that append_locked or identity tracking add later.
+    if len(json.dumps(probe, ensure_ascii=False, allow_nan=False)) + 512 > EVENT_MAX_CHARS - 1:
+        raise RmemError(f"event would exceed {EVENT_MAX_CHARS - 1:,} characters; move long text to --note-file "
+                        "and cite large evidence with --source or --artifact")
+
+
+def commit_log_event(hub: Path, who: dict, event: dict, a):
+    """The locked half of log and capture: ownership, import deduplication, note files, append.
+    Returns the appended event, or None for an import that is already in the ledger."""
     with hub_lock(hub):
         consistency_preflight(hub)
         if a.thread:
-            require_claim(hub, a.thread, who)
-        if a.kind == "import":
+            authorize_thread_write(hub, a.thread, who, "log", event_id=event.get("id"))
+        if event["kind"] == "import":
+            key = (event["source_namespace"], event["source_id"])
             for previous in events_locked(hub):
                 if previous["kind"] == "CORRUPT":
                     raise RmemError("repair the corrupt ledger before importing; deduplication cannot be guaranteed")
-                if (previous.get("source_namespace"), previous.get("source_id")) == (a.source_namespace, a.source_id):
+                if (previous.get("source_namespace"), previous.get("source_id")) == key:
                     if import_fingerprint(previous) == event["import_fingerprint"]:
-                        print(f"already imported: {a.source_namespace}/{a.source_id}")
-                        return 0
+                        print(f"already imported: {key[0]}/{key[1]}")
+                        return None
                     raise RmemError("conflicting evidence or content for this source namespace/ID; inspect the existing import")
-        event = append_locked(hub, event)
-    out = Output()
-    out.add("logged: " + fmt_event(event))
+        created = record_view(queries.store_bodies, hub, event)
+        try:
+            return append_locked(hub, event)
+        except BaseException:
+            queries.remove_created(created)
+            raise
+
+
+def logged_output(label: str, event: dict, config: dict) -> None:
+    out = Output(config["caps"]["output_max_chars"])
+    out.add(f"{label}: " + fmt_event(event, config))
+    for prefix, name in (("body", "note body"), ("cmd", "command text")):
+        if event.get(f"{prefix}_path"):
+            out.add(f"{name}: {event[prefix + '_path']} ({event[prefix + '_chars']:,} characters); "
+                    f"read it with rmem show {event['event_id']} --field {prefix}")
+    hint = queries.provenance_hint(event)
+    if hint:
+        out.add("hint: " + hint)
     out.emit()
+
+
+def cmd_log(a):
+    hub = find_hub()
+    who = actor(a, required=bool(a.thread))
+    config = load_config(hub)
+    event = commit_log_event(hub, who, build_log_event(a, who, config, hub), a)
+    if event is not None:
+        logged_output("logged", event, config)
+    return 0
+
+
+def cmd_capture(a):
+    """Record a command that was already submitted elsewhere (ssh, sbatch); nothing is executed."""
+    hub = find_hub()
+    who = actor(a, required=True)
+    config = load_config(hub)
+    submitted = a.submitted[1:] if a.submitted and a.submitted[0] == "--" else a.submitted
+    if sum(map(bool, (submitted, a.cmd is not None, a.cmd_file))) != 1:
+        raise RmemError("give the submitted command exactly once: after -- (rmem capture --id E1 --thread T "
+                        "--host H -- sbatch run.sh), with --cmd TEXT, or with --cmd-file PATH")
+    a.argv, a.captured = submitted, True
+    event = commit_log_event(hub, who, build_log_event(a, who, config, hub), a)
+    logged_output("captured (not executed)", event, config)
     return 0
 
 
 def cmd_note(a):
     hub, who = find_hub(), actor(a, required=True)
     one_line(a.text, "note", 4000)
-    name = f"{dt.date.today().isoformat()}-{who['agent']}-{who['session']}.md"
+    if not a.allow_sensitive and highlights.SECRET_TEXT.search(a.text):
+        refuse_sensitive(["the journal note"])
+    # WHY: events are stored in UTC, so journal days follow the UTC date too.
+    name = f"{dt.datetime.now(dt.timezone.utc).date().isoformat()}-{who['agent']}-{who['session']}.md"
     with hub_lock(hub):
-        consistency_preflight(hub)
+        consistency_preflight(hub, who=who)
         path = safe_path(hub, "journal", name)
         with open_regular(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, "a") as stream:
             stream.write(f"- {now()} {a.text}\n")
@@ -887,15 +1813,23 @@ def cmd_note(a):
 
 def cmd_run(a):
     hub, who = find_hub(), actor(a, required=True)
+    config = load_config(hub)
     command = a.cmd[1:] if a.cmd and a.cmd[0] == "--" else a.cmd
     if not command:
         raise RmemError("usage: rmem run --id E001 --thread SLUG -- COMMAND ...")
     metadata = extra_metadata(a, "observed")
-    code = provenance(Path.cwd())  # The experiment must retain its starting revision.
+    code = provenance(Path.cwd(), hub)  # The experiment must retain its starting revision.
     run_id = uuid.uuid4().hex
     relative_log = f"runs/{a.id}/{run_id}.log"
+    # WHY: the command runs as given, but a ledger line cannot be redacted later, so secrets are recorded masked.
+    recorded_argv = [highlights.redact_secrets(arg) for arg in command]
     common = {**who, **metadata, "id": a.id, "thread": a.thread, "run_id": run_id,
-              "log": relative_log, "argv": command, "provenance": code}
+              "log": relative_log, "argv": recorded_argv, "provenance": code}
+    if recorded_argv != command:
+        common["redacted"] = ["argv"]
+        print("rmem: warning: the command contains text that looks like a key, token or password; it runs unchanged, "
+              "but the ledger records it as <redacted>. Pass secrets through the environment, not the command line",
+              file=sys.stderr)
     if code.get("commit"):
         common.update(commit=code["commit"], dirty=code["dirty"])
     # Reserve space for timestamps, errors, and terminal fields before launching.
@@ -919,7 +1853,7 @@ def cmd_run(a):
     t0 = time.monotonic()
     try:
         with hub_lock(hub):
-            require_claim(hub, a.thread, who)
+            authorize_thread_write(hub, a.thread, who, "run")
             directory = safe_path(hub, "runs", a.id)
             directory.mkdir(parents=True, exist_ok=True)
             logfile = safe_path(hub, relative_log)
@@ -982,7 +1916,7 @@ def cmd_run(a):
         tail.append(display)
         if a.grep.search(line):
             hits.append(display)
-    out = Output()
+    out = Output(config["caps"]["output_max_chars"])
     out.add(f"exit={returncode} status={status_name} time={time.monotonic() - t0:.1f}s lines={line_count} log={logfile}")
     if hits:
         out.add("--- metric lines ---")
@@ -996,50 +1930,134 @@ def cmd_run(a):
     return returncode
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise RmemError(f"expected a regular file: {path}")
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def read_manifest(hub: Path):
+    """(manifest, problem); problem is 'missing' for hubs installed before 0.4.0."""
+    path = hub / MANIFEST_NAME
+    if not path.exists() and not path.is_symlink():
+        return None, "missing"
+    try:
+        with open_regular(safe_path(hub, MANIFEST_NAME), os.O_RDONLY, "r") as stream:
+            manifest = json.loads(stream.read(1024 * 1024))
+    except (OSError, RmemError, json.JSONDecodeError, RecursionError) as exc:
+        return None, f"unreadable: {clipped(exc, 200)}"
+    if (not isinstance(manifest, dict) or not isinstance(manifest.get("files"), dict)
+            or any(not isinstance(v, str) for v in manifest["files"].values())):
+        return None, "invalid: expected an object with a files map of path to sha256"
+    return manifest, ""
+
+
+def manifest_changes(hub: Path, manifest: dict) -> list:
+    """Sorted (relative path, 'modified'|'missing'|problem) for kit files that differ from the manifest."""
+    changes = []
+    for name, expected in sorted(manifest["files"].items()):
+        try:
+            path = safe_path(hub, name)
+            if not path.is_file():
+                changes.append((name, "missing"))
+            elif file_sha256(path) != expected:
+                changes.append((name, "modified"))
+        except (OSError, RmemError) as exc:
+            changes.append((name, f"unreadable ({clipped(exc, 120)})"))
+    return changes
+
+
 def cmd_check(a):
     hub = find_hub()
-    out, failures = Output(), 0
+    config, config_error, config_warnings = config_report(hub)
+    if a.require_records_since is not None:
+        a.require_records_since = parse_user_time(a.require_records_since, config)
+    caps = config["caps"]
+    out, failures = Output(caps["output_max_chars"]), 0
+
+    def report(level, message):
+        nonlocal failures
+        if level == "fail":
+            failures += 1
+            out.add("! " + message)
+        else:
+            out.add(f"{level}: {message}")
 
     def problem(message):
-        nonlocal failures
-        failures += 1
-        out.add("! " + message)
+        report("fail", message)
 
-    with hub_lock(hub, shared=True):
+    with hub_lock(hub, shared=True, readonly_ok=True):
+        events = list(events_locked(hub))
+        if config_error:
+            problem(config_error)
+        for warning in config_warnings:
+            report("warn", warning)
         if not a.records:
-            files = [(safe_path(hub, "STATE.md"), STATE_MAX_LINES, STATE_MAX_CHARS)]
-            files += [(p, THREAD_MAX_LINES, THREAD_MAX_CHARS) for p in safe_path(hub, "threads").glob("*.md")]
+            files = [(safe_path(hub, "STATE.md"), caps["state_max_lines"], caps["state_max_chars"])]
+            files += [(p, caps["thread_max_lines"], caps["thread_max_chars"])
+                      for p in sorted(safe_path(hub, "threads").glob("*.md"))]
             for path, line_cap, char_cap in files:
                 try:
-                    safe_path(hub, str(path.relative_to(hub)))
-                    nlines = sum(1 for _ in bounded_lines(path))
-                    if nlines > line_cap or path.stat().st_size > char_cap:
-                        problem(f"{path.relative_to(hub)} exceeds context cap ({line_cap} lines / {char_cap} bytes)")
+                    name = path.relative_to(hub)
+                    safe_path(hub, str(name))
+                    usage, lines, chars = cap_usage(path, line_cap, char_cap)
+                    detail = f"{chars:,} / {char_cap:,} characters, {lines} / {line_cap} lines"
+                    if usage > 1:
+                        problem(f"{name} exceeds context cap ({detail}). Move settled detail to findings/<topic>.md "
+                                "and leave a one-line pointer; do not delete spaces or compress wording to fit")
+                    elif usage >= caps["soft_ratio"]:
+                        report("warn", f"{name} is at {usage:.0%} of its context cap ({detail}; soft target "
+                               f"{caps['soft_ratio']:.0%}). Move settled detail to findings/<topic>.md with a pointer; "
+                               "caps are alarms, not targets, so never delete spaces or compress wording")
                 except RmemError as exc:
                     problem(str(exc))
-            for directory in sorted(safe_path(hub, "claims").iterdir()):
-                if directory.name == ".gitkeep":
+            # An expired lease is a warning: integrity problems fail, and inactivity is not corruption.
+            activity = session_activity(events)
+            for key, meta, error in lease_entries(hub):
+                if error:
+                    problem(f"claim '{key}': {error}")
                     continue
-                try:
-                    identifier(directory.name)
-                    meta, error = load_claim(hub, directory.name)
-                    if error:
-                        problem(f"claim '{directory.name}': {error}")
-                    elif (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(meta["ts"])).total_seconds() > STALE_CLAIM_HOURS * 3600:
-                        problem(f"claim '{directory.name}' is older than {STALE_CLAIM_HOURS}h; check its owner and jobs")
-                except (RmemError, argparse.ArgumentTypeError) as exc:
-                    problem(str(exc))
+                lease = lease_status(meta, events, config, activity, key)
+                if not lease["live"]:
+                    report("warn", f"lease on {lease_label(key)} held by {lease_holder(meta, lease, config)}; the owner "
+                           f"can release it, or after checking its jobs another session can take it over with "
+                           f"`rmem claim {lease_argument(key)} --takeover --reason TEXT`")
+            manifest, manifest_problem = read_manifest(hub)
+            if manifest_problem == "missing":
+                report("info", f"no {MANIFEST_NAME}: this hub was installed before 0.4.0, so local changes "
+                       "to kit files cannot be detected")
+            elif manifest_problem:
+                report("warn", f"{MANIFEST_NAME} is {manifest_problem}")
+            else:
+                changes = manifest_changes(hub, manifest)
+                for name, state in changes[:10]:
+                    report("warn", f"kit file {name} is {state} since install (kit {clipped(manifest.get('kit_version', '?'), 40)}); "
+                           "keep project changes in hub-config.json or bin/plugins/ so an upgrade can replace kit files")
+                if len(changes) > 10:
+                    report("warn", f"{len(changes)} kit files differ from {MANIFEST_NAME}; showing the first 10 (rmem version lists them)")
+            for project, canonical in stale_link_blocks(hub, events):
+                report("warn", f"the rmem block in {project / 'AGENTS.md'} differs from what this kit writes (for example "
+                       f"after an upgrade); refresh it with `rmem link {'--canonical ' if canonical else ''}"
+                       f"{shlex.quote(str(project))}`")
         imports = {}
         active = set()
         event_ids, sequences = set(), set()
-        events = list(events_locked(hub))
+        unknown_kinds = Counter()
         issues, _ = consistency_snapshot(hub, events)
         for issue in issues:
             problem(f"claim/ledger '{issue['thread']}': {'; '.join(issue['problems'])}")
+        known_kinds = module_table()["kinds"]
         for event in events:
             if event["kind"] == "CORRUPT":
                 problem("ledger: " + event["note"])
                 continue
+            if event["kind"] not in known_kinds:
+                unknown_kinds[event["kind"]] += 1
             if event.get("event_id"):
                 if event["event_id"] in event_ids:
                     problem(f"ledger: duplicate event_id {event['event_id']}")
@@ -1064,6 +2082,12 @@ def cmd_check(a):
                 active.discard(event.get("run_id"))
         if active:
             out.add(f"info: {len(active)} unfinished run(s); may still be running, inspect before recovery")
+        if unknown_kinds:
+            shown = ", ".join(f"{clipped(kind, 60)} ({number})" for kind, number in unknown_kinds.most_common(8))
+            report("info", f"ledger has event kinds that neither the core nor a loaded module declares: {shown}; "
+                   "a feature module or plugin may be missing")
+        for level, message in module_problems(context(hub, events, config, a)):
+            report(level, message)
         coverage = record_view(coverage_view, hub, events)
         out.add("records: " + json.dumps(coverage, ensure_ascii=False, separators=(",", ":"), allow_nan=False))
     if not failures:
@@ -1089,17 +2113,80 @@ def append_block(text: str, block: str) -> str:
     return text + separator + block
 
 
+def link_executable(hub: Path, project: Path, canonical: bool) -> str:
+    """How the managed block tells agents in `project` to run this hub's CLI."""
+    if canonical:
+        return '"$(cat .rmem)/bin/rmem"'
+    return shlex.quote(str(Path(os.path.relpath(hub, project)) / "bin" / "rmem"))
+
+
+def link_block(hub: Path, project: Path, canonical: bool) -> str:
+    """The managed RMEM block that `rmem link` writes into the project's AGENTS.md."""
+    relative = os.path.relpath(hub, project)
+    executable = link_executable(hub, project, canonical)
+    if canonical:
+        where = ("The canonical memory hub is the absolute path stored in `.rmem` "
+                 "(one per checkout and device, not tracked by Git).\n"
+                 f"From this directory, run `{executable} status`, then read `AGENTS.md` in that hub.\n")
+    else:
+        where = (f"The memory hub is `{relative}`, relative to this project directory.\n"
+                 f"From this directory, run `{executable} status`, then read `{relative}/AGENTS.md`.\n")
+    return (f"{BLOCK_START}\n## Shared research memory (rmem)\n{where}"
+            f"After a compaction, a resume or a fork, run `{executable} resume` before anything else.\n"
+            "Identity: pass `--session ID` on every call (exported variables do not persist between tool calls),\n"
+            "or omit it inside Claude Code or Codex so rmem derives the session from the conversation.\n"
+            "A subagent or parallel worker inside one conversation shares its ID, so it passes its own `--session ID`.\n"
+            f"After a fork, run `{executable} session start --parent OLD-SESSION`; `{executable} whoami` shows the identity in use.\n"
+            "Use the project's metadata index to select the relevant short thread first.\n"
+            f"Then use `{executable} catalog --query TOPIC` and `show EXACT_ID` before opening exact cited evidence.\n"
+            "Keep one canonical writable hub; a code worktree or remote worker is not a second memory authority.\n"
+            f"Run noisy commands through `{executable} run`; query evidence instead of pasting raw logs.\n{BLOCK_END}\n")
+
+
+def linked_projects(hub: Path, events) -> list:
+    """[(project, canonical)] from the latest link event per project whose .rmem still points to this hub."""
+    latest = {}
+    for event in events:
+        if event.get("kind") == "link" and isinstance(event.get("where"), str):
+            latest[event["where"]] = bool(event.get("canonical"))
+    found = []
+    for where, canonical in latest.items():
+        project = Path(where)
+        try:
+            if pointer_target(project / ".rmem") == hub:
+                found.append((project, canonical))
+        except (OSError, RmemError, UnicodeError):
+            continue
+    return found
+
+
+def stale_link_blocks(hub: Path, events, limit: int = 10) -> list:
+    """[(project, canonical)] whose managed block differs from what `rmem link` writes now (after an upgrade)."""
+    stale = []
+    for project, canonical in linked_projects(hub, events)[:limit]:
+        try:
+            text = (project / "AGENTS.md").read_text(encoding="utf-8")
+            span = marker_span(text, str(project / "AGENTS.md"))
+        except (OSError, RmemError, UnicodeError):
+            continue
+        if span and text[span[0]:span[1]] != link_block(hub, project, canonical):
+            stale.append((project, canonical))
+    return stale
+
+
 def cmd_link(a):
     hub, who = find_hub(), actor(a)
     project = Path(a.project_dir).expanduser().resolve()
     if not project.is_dir():
         raise RmemError(f"project is not a directory: {project}")
     relative = os.path.relpath(hub, project)
-    one_line(relative, "hub path", 4096)
-    if "`" in relative:
+    # WHY: --canonical stores this device's absolute path, so every checkout and worktree reaches one hub.
+    target = str(hub) if a.canonical else relative
+    one_line(target, "hub path", 4096)
+    if "`" in target:
         raise RmemError("hub paths containing backticks are not supported in instruction blocks")
     with directory_lock(project), hub_lock(hub):
-        consistency_preflight(hub)
+        consistency_preflight(hub, who=who)  # WHY: a forked conversation is refused before any file is written
         pointer = safe_path(project, ".rmem")
         agents = safe_path(project, "AGENTS.md")
         claude = safe_path(project, "CLAUDE.md")
@@ -1109,27 +2196,49 @@ def cmd_link(a):
         ctext = claude.read_text(encoding="utf-8") if claude.exists() else ""
         span = marker_span(text, "AGENTS.md")
         marker_span(ctext, "CLAUDE.md")
-        executable = shlex.quote(str(Path(relative) / "bin" / "rmem"))
-        block = (f"{BLOCK_START}\n## Shared research memory (rmem)\n"
-                 f"The memory hub is `{relative}`, relative to this project directory.\n"
-                 f"From this directory, run `{executable} status`, then read `{relative}/AGENTS.md`.\n"
-                 "Use a unique RMEM_SESSION for each working session and follow the shared protocol.\n"
-                 "Use the project's metadata index to select the relevant short thread first.\n"
-                 f"Then use `{executable} catalog --query TOPIC` and `show EXACT_ID` before opening exact cited evidence.\n"
-                 "Keep one canonical writable hub; a code worktree or remote worker is not a second memory authority.\n"
-                 f"Run noisy commands through `{executable} run`; query evidence instead of pasting raw logs.\n{BLOCK_END}\n")
+        block = link_block(hub, project, a.canonical)
         updated = text[:span[0]] + block + text[span[1]:] if span else append_block(text, block)
         if not re.search(r"(?m)^\s*@AGENTS\.md\s*$", ctext):
             ctext = append_block(ctext, "@AGENTS.md\n\nRead AGENTS.md in this directory for the shared memory protocol.\n")
         # Validate all three files before the first write. Each replacement is atomic.
-        for path, value in ((agents, updated), (claude, ctext), (pointer, relative + "\n")):
+        for path, value in ((agents, updated), (claude, ctext), (pointer, target + "\n")):
             if path.exists() and not path.is_file():
                 raise RmemError(f"expected a regular file: {path}")
-        for path, value in ((agents, updated), (claude, ctext), (pointer, relative + "\n")):
+        for path, value in ((agents, updated), (claude, ctext), (pointer, target + "\n")):
             atomic_write(path, value)
-        append_locked(hub, {**who, "kind": "link", "where": str(project), "replaced": a.replace})
-    print(f"linked {project} → {relative}; record the location in MAP.md")
+        notes = research_git.exclude_pointer(pointer) if a.canonical else []
+        append_locked(hub, {**who, "kind": "link", "where": str(project), "replaced": a.replace,
+                            **({"canonical": True} if a.canonical else {})})
+    print(f"linked {project} → {target}{' (absolute pointer for this checkout and device)' if a.canonical else ''}; "
+          "record the location in MAP.md")
+    for note in notes:
+        print(note)
     return 0
+
+
+# Kit files init copies (and records in .kit-manifest.json); tracks append their own.
+KIT_FILES = ("README.md", "AGENTS.md", "CLAUDE.md", "BOOTSTRAP.md", "SKILL.md",
+             "findings/README.md", "RECORDS.md", "RECORD_TEMPLATE.json", "HIGHLIGHTS.md",
+             "HIGHLIGHT_TEMPLATE.json", "CONSISTENCY.md", "INDEXED_READING.md",
+             "CONTEXT_INDEX_TEMPLATE.json", "CONFIG.md", "HUB_CONFIG_TEMPLATE.json", "VERSION",
+             ".gitattributes", ".gitignore", ".rgignore", "bin/plugins/README.md", "HANDOFF.md", "GIT.md",
+             "LIFECYCLE.md", "UPGRADE.md", "KIT_HISTORY.json")
+KIT_HELPERS = ("research_records.py", "research_highlights.py", "artifact_routes.py",
+               "research_consistency.py", "context_reader.py", "rmem_config.py",
+               "research_queries.py", "research_identity.py", "research_handoff.py", "research_git.py",
+               "research_lifecycle.py", "research_upgrade.py")
+# Anchored so that runs/ or claims/ deeper in a project tree stay visible to Git.
+IGNORE_RULES = (("runs/", "/runs/"), ("claims/", "/claims/"), (".rmem.lock", "/.rmem.lock"),
+                (None, "__pycache__/"), (None, "/ledger.jsonl.bak-*"))
+
+
+def ignore_rules(text: str) -> str:
+    lines = text.splitlines()
+    for legacy, rule in IGNORE_RULES:
+        lines = [rule if line == legacy else line for line in lines]
+        if rule not in lines:
+            lines.append(rule)
+    return "\n".join(lines) + "\n"
 
 
 def cmd_init(a):
@@ -1140,67 +2249,80 @@ def cmd_init(a):
     if destination.exists() and (not destination.is_dir() or any(destination.iterdir())):
         raise RmemError("init destination must be absent or an empty directory")
     name = one_line(a.project_name or destination.name, "project name", 200)
-    source = Path(__file__).resolve().parent.parent
+    source = kit_root()
     destination.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".rmem-init-", dir=destination.parent))
     try:
-        for directory in ("bin", "threads", "claims", "journal", "findings", "runs"):
+        for directory in ("bin", "bin/plugins", "threads", "claims", "journal", "findings", "runs"):
             (staging / directory).mkdir()
-        whitelist = ("README.md", "AGENTS.md", "CLAUDE.md", "BOOTSTRAP.md", "SKILL.md",
-                     "findings/README.md", "RECORDS.md", "RECORD_TEMPLATE.json", "HIGHLIGHTS.md",
-                     "HIGHLIGHT_TEMPLATE.json", "CONSISTENCY.md", "INDEXED_READING.md",
-                     "CONTEXT_INDEX_TEMPLATE.json", ".gitattributes", ".gitignore")
-        for item in whitelist:
+        copied = []
+        for item in KIT_FILES:
             origin = safe_path(source, item)
             if origin.is_file():
                 shutil.copyfile(origin, staging / item)
+                copied.append(item)
         shutil.copyfile(Path(__file__).resolve(), staging / "bin/rmem")
-        shutil.copyfile(safe_path(source, "bin", "research_records.py"), staging / "bin/research_records.py")
-        for helper in ("research_highlights.py", "artifact_routes.py", "research_consistency.py", "context_reader.py"):
+        for helper in KIT_HELPERS:
             shutil.copyfile(safe_path(source, "bin", helper), staging / "bin" / helper)
+        copied += ["bin/rmem"] + [f"bin/{helper}" for helper in KIT_HELPERS]
         (staging / "bin/rmem").chmod(0o755)
-        (staging / "STATE.md").write_text(f"# STATE — {name}\n<!-- Budget: 120 lines; keep this file concise. -->\n\n## Goal\nNot configured. Define the research question and completion criteria from verified project sources.\n\n## Constraints and operational state\n- Memory initialization does not authorize execution or enable automation.\n- Record canonical controller/owner, host holds, resource limits, and verification time here.\n- Use original experiment IDs; preserve configuration and evidence provenance.\n\n## Thread index\n| slug | status | one-line state and next step | evidence |\n|---|---|---|---|\n\n## Settled decisions\nNo project decisions imported yet.\n\n## Open questions\n- Establish authoritative sources and import coverage before research takeover.\n", encoding="utf-8")
+        (staging / "STATE.md").write_text(f"# STATE — {name}\n<!-- Budget: caps.state_max_lines / state_max_chars in hub-config.json (see CONFIG.md); keep this file concise. -->\n\n## Goal\nNot configured. Define the research question and completion criteria from verified project sources.\n\n## Constraints and operational state\n- Memory initialization does not authorize execution or enable automation.\n- Record canonical controller/owner, host holds, resource limits, and verification time here.\n- Use original experiment IDs; preserve configuration and evidence provenance.\n\n## Thread index\n| slug | status | one-line state and next step | evidence |\n|---|---|---|---|\n\n## Settled decisions\nNo project decisions imported yet.\n\n## Open questions\n- Establish authoritative sources and import coverage before research takeover.\n", encoding="utf-8")
         (staging / "MAP.md").write_text("# MAP — project locations and source authority\n\n| Location | Role / authority | Availability and observed time | New location after migration |\n|---|---|---|---|\n\n## Rules\n- One canonical writable memory hub; external folders are sources or artifacts.\n- Record source precedence and unresolved contradictions explicitly.\n- Relative locations resolve from this hub unless a row states otherwise.\n- Remote workers return artifacts, not competing writable hubs.\n- Claims and operating permissions are never inherited from another project.\n", encoding="utf-8")
         (staging / "ledger.jsonl").write_text("", encoding="utf-8")
+        template = staging / "HUB_CONFIG_TEMPLATE.json"
+        (staging / rmem_config.CONFIG_NAME).write_text(
+            template.read_text(encoding="utf-8") if template.is_file() else rmem_config.template_text(), encoding="utf-8")
         ignore = staging / ".gitignore"
-        rules = ignore.read_text(encoding="utf-8") if ignore.exists() else ""
-        for rule in ("runs/", "claims/", ".rmem.lock", "__pycache__/"):
-            if rule not in rules.splitlines():
-                rules += ("" if not rules or rules.endswith("\n") else "\n") + rule + "\n"
-        ignore.write_text(rules, encoding="utf-8")
+        ignore.write_text(ignore_rules(ignore.read_text(encoding="utf-8") if ignore.exists() else ""), encoding="utf-8")
         for directory in ("threads", "journal"):
             (staging / directory / ".gitkeep").touch()
+        manifest = {"schema_version": 1, "kit_version": kit_version(), "installed_at": now(),
+                    "files": {item: file_sha256(staging / item) for item in sorted(copied)}}
+        (staging / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         # os.replace rejects a destination that became nonempty during initialization.
         os.replace(staging, destination)
     finally:
         if staging.exists():
             shutil.rmtree(staging)
-    print(f"initialized {destination} (no Git repository or automation was started)")
+    print(f"initialized {destination} with rmem-kit {kit_version()} (no Git repository or automation was started)")
     return 0
+
+
+# Hub folders whose Markdown files are memory (committed by sync).
+MEMORY_DIRS = ("threads", "findings", "journal", "notes", "lessons", "history")
 
 
 def memory_path(value: str) -> bool:
     path = Path(value)
     return (value in ("STATE.md", "MAP.md", "ledger.jsonl") or
-            len(path.parts) >= 2 and path.parts[0] in ("threads", "findings", "journal")
-            and (path.suffix == ".md" or path.name == ".gitkeep"))
+            len(path.parts) >= 2 and path.parts[0] in MEMORY_DIRS
+            and (path.suffix == ".md" or path.name in (".gitkeep", "SNAPSHOTS.json")))
 
 
 def cmd_sync(a):
+    if a.embedded:
+        return research_git.cmd_sync_embedded(a, core)
+    if a.per_event or a.dry_run or a.include_untracked:
+        raise RmemError("--per-event, --dry-run and --include-untracked need --embedded (which also works when the "
+                        "hub is its own repository)")
     hub = find_hub()
     who = actor(a)
     with hub_lock(hub):
         consistency_preflight(hub)
         root = run_git(hub, "rev-parse", "--show-toplevel", check=False)
-        if root.returncode or Path(root.stdout.strip()).resolve() != hub:
-            raise RmemError("hub must be its own Git repository; initialize it explicitly first")
+        if root.returncode:
+            raise RmemError("the hub is not in a Git repository; run `git init` in the hub for a memory-only "
+                            "repository, or keep it inside your project repository and use `rmem sync --embedded`")
+        if Path(root.stdout.strip()).resolve() != hub:
+            raise RmemError(f"the hub is inside the Git repository {root.stdout.strip()}, not its own repository; "
+                            "`rmem sync --embedded [--per-event]` commits only the hub files there (see GIT.md)")
         staged = run_git(hub, "diff", "--cached", "--name-only", "-z").stdout.split("\0")
         unrelated = [name for name in staged if name and not memory_path(name)]
         if unrelated:
             raise RmemError("unrelated staged files would be committed: " + clipped(", ".join(unrelated), 1000))
         paths = {name for name in run_git(hub, "ls-files", "-z").stdout.split("\0") if name and memory_path(name)}
         paths.update(name for name in ("STATE.md", "MAP.md", "ledger.jsonl") if safe_path(hub, name).exists())
-        for directory in ("threads", "findings", "journal"):
+        for directory in MEMORY_DIRS:
             for path in safe_path(hub, directory).rglob("*"):
                 relative = str(path.relative_to(hub))
                 if path.is_symlink():
@@ -1227,6 +2349,170 @@ def cmd_sync(a):
     return 0
 
 
+def cmd_version(a):
+    out = Output()
+    out.add(f"rmem-kit {kit_version()} (running {Path(__file__).resolve()})")
+    try:
+        hub = find_hub()
+    except RmemError as exc:
+        out.add(f"hub: none found ({exc})")
+        out.emit()
+        return 0
+    out.add(f"hub: {hub}")
+    manifest, problem = read_manifest(hub)
+    if problem == "missing":
+        out.add(f"hub manifest: none ({MANIFEST_NAME} is missing: installed before 0.4.0)")
+    elif problem:
+        out.add(f"hub manifest: {problem}")
+    else:
+        installed = display_time(manifest.get("installed_at", "?"), config_report(hub)[0])
+        out.add(f"hub manifest: kit {clipped(manifest.get('kit_version', '?'), 40)}, installed {installed}, "
+                f"{len(manifest['files'])} kit files")
+        changes = manifest_changes(hub, manifest)
+        out.add(f"kit files changed since install: {len(changes)}")
+        for name, state in changes[:20]:
+            out.add(f"- {clipped(name, 200)}: {state}")
+        if len(changes) > 20:
+            out.add(f"[{len(changes) - 20} more not shown]")
+    out.emit()
+    return 0
+
+
+def access_line(label: str, path: Path, directory: bool = False) -> str:
+    """Describe read/write access without modifying anything."""
+    if not path.exists() and not path.is_symlink():
+        parent = os.access(path.parent, os.W_OK | os.X_OK)
+        return f"- {label}: missing; {'can' if parent else 'cannot'} be created here (permission bits)"
+    if path.is_symlink():
+        return f"- {label}: refused (symlink)"
+    if directory:
+        read = "ok" if os.access(path, os.R_OK | os.X_OK) else "denied"
+        write = "ok" if os.access(path, os.W_OK | os.X_OK) else "denied"
+        return f"- {label}: read {read}, write {write} (permission bits; a sandbox can still refuse writes)"
+    results = []
+    for name, flags in (("read", os.O_RDONLY), ("write", os.O_WRONLY | os.O_APPEND)):
+        try:
+            os.close(os.open(path, flags | getattr(os, "O_NOFOLLOW", 0) | os.O_NONBLOCK))
+            results.append(f"{name} ok")
+        except OSError as exc:
+            results.append(f"{name} denied ({exc.strerror})")
+    return f"- {label}: {', '.join(results)}"
+
+
+def harness_of(environ) -> str:
+    if environ.get("CLAUDECODE") or environ.get("CLAUDE_CODE_SESSION_ID"):
+        return "claude"
+    if any(key.startswith("CODEX_") for key in environ):
+        return "codex"
+    return "unknown"
+
+
+def cmd_doctor(a):
+    """Read-only diagnosis of the interpreter, hub access, identity sources, config and plugins."""
+    out, env = Output(), os.environ
+    out.add("# rmem doctor (read-only)")
+    version_ok = sys.version_info >= (3, 10)
+    out.add(f"python: {sys.version.split()[0]} ({sys.executable})" + ("" if version_ok else " — rmem needs Python 3.10 or newer"))
+    out.add(f"kit: rmem-kit {kit_version()} running from {Path(__file__).resolve()}")
+    hub = None
+    try:
+        hub, how = discover_hub()
+        out.add(f"hub: {hub} (found via {how})")
+        validate_hub(hub)
+    except (RmemError, OSError) as exc:
+        out.add(f"hub: problem: {clipped(exc, 600)}")
+    if hub is not None and hub.is_dir():
+        out.add("\n## Access for this process")
+        out.add(access_line("hub directory", hub, directory=True))
+        out.add(access_line("ledger.jsonl", hub / "ledger.jsonl"))
+        out.add(access_line(".rmem.lock", hub / ".rmem.lock"))
+        out.add(access_line("threads/", hub / "threads", directory=True))
+        out.add(access_line("claims/", hub / "claims", directory=True))
+        config, error, warnings = config_report(hub)
+        out.add("\n## Configuration")
+        if error:
+            out.add(f"- invalid: {error}")
+        else:
+            state = "present" if (hub / rmem_config.CONFIG_NAME).exists() else "absent (kit defaults)"
+            out.add(f"- {rmem_config.CONFIG_NAME}: {state}, valid; display zone "
+                    f"{config['display_tz'] or 'system'}{' (from RMEM_TZ)' if env.get('RMEM_TZ') else ''}")
+        for warning in warnings[:10]:
+            out.add(f"- warning: {warning}")
+        manifest, problem = read_manifest(hub)
+        out.add(f"- kit manifest: {problem or 'kit ' + clipped(manifest.get('kit_version', '?'), 40)}"
+                + (" (installed before 0.4.0)" if problem == "missing" else ""))
+    out.add("\n## Identity sources (values of harness variables are never printed)")
+    try:
+        who = actor(a)
+        out.add(f"- agent label: {who['agent']}; session: {who.get('session', 'not set (thread writes need --session or RMEM_SESSION)')}")
+    except RmemError as exc:
+        out.add(f"- identity problem: {exc}")
+    for name in ("RMEM_SESSION", "RMEM_AGENT", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CLAUDECODE",
+                 "CLAUDE_CODE_CHILD_SESSION"):
+        out.add(f"- {name}: {'present' if env.get(name) else 'absent'}")
+    for warning in identity.shared_identity_warnings(a):
+        out.add("- warning: " + warning)
+    harness = harness_of(env)
+    out.add(f"- detected harness: {harness}")
+    out.add("\n## Git")
+    git = shutil.which("git")
+    if git is None:
+        out.add("- git: not found on PATH (provenance is recorded as unavailable)")
+    else:
+        try:
+            version = run_git(Path.cwd(), "--version", check=False).stdout.strip()
+            out.add(f"- git: {git} ({clipped(version, 80)})")
+            if hub is not None and hub.is_dir():
+                top = run_git(hub, "rev-parse", "--show-toplevel", check=False)
+                out.add(f"- hub repository: {top.stdout.strip() if not top.returncode else 'not inside a Git repository'}")
+        except RmemError as exc:
+            out.add(f"- git: problem: {exc}")
+    out.add("\n## Feature modules and plugins")
+    loaded = [entry.label for entry in feature_modules()]
+    out.add(f"- loaded: {len(loaded)}" + (f" ({clipped(', '.join(loaded), 600)})" if loaded else ""))
+    for label, broken in sorted(BROKEN_MODULES.items())[:20]:
+        out.add(f"- not working: {label} ({broken['origin']}): {broken['error']}")
+    out.add("\n## Harness hints")
+    where = hub or "<hub>"
+    if harness in ("codex", "unknown"):
+        out.add(f"- Codex: make the hub a writable root instead of approving every rmem command, for example "
+                f"`codex --add-dir {where}` (or list it under sandbox_workspace_write.writable_roots).")
+    if harness in ("claude", "unknown"):
+        executable, note = allow_prefix(hub)
+        first = ", ".join(f'"Bash({executable} {name}:*)"' for name in ALLOW_COMMANDS[:2])
+        out.add(f"- Claude Code: allow this hub's CLI in .claude/settings.local.json permissions, one rule per command "
+                f"in the form agents run it from here: {first}, and the same for {', '.join(ALLOW_COMMANDS[2:])}. "
+                f"Give --session after the command name (`{executable} log --session S ...`): an identity before it "
+                f"changes the prefix, so the rule no longer matches. {note}Start with `claude --add-dir {where}` when "
+                "the hub is outside the project. Do not allow `rmem run` broadly: it runs arbitrary commands.")
+    out.emit()
+    return 0
+
+
+# Everyday commands for a Claude Code allow rule; `run` is left out on purpose (it runs any command).
+ALLOW_COMMANDS = ("status", "resume", "recent", "show", "catalog", "inbox", "whoami", "pending", "checkpoint",
+                  "log", "capture", "claim", "release", "note", "request", "ack", "close", "check")
+
+
+def allow_prefix(hub):
+    """(the command prefix agents use for this hub from the working directory, a note about it). A relative
+    link uses the relative path that the managed block writes; a canonical link's "$(cat .rmem)" form holds
+    a command substitution that no prefix rule matches, so it gets this device's absolute path."""
+    absolute = shlex.quote(str(Path(hub or "<hub>") / "bin" / "rmem"))
+    if hub is None:
+        return absolute, ""
+    try:
+        pointer = Path.cwd() / ".rmem"
+        if pointer.is_file() and not pointer.is_symlink() and pointer_target(pointer) == hub:
+            if Path(pointer.read_text(encoding="utf-8").strip()).expanduser().is_absolute():
+                return absolute, ('The block\'s "$(cat .rmem)/bin/rmem" form cannot be matched by a prefix rule, '
+                                  "so run the absolute path shown here on this device. ")
+            return link_executable(hub, Path.cwd().resolve(), False), ""
+    except (OSError, RmemError, UnicodeError):
+        pass
+    return absolute, ""
+
+
 def add_metadata(parser):
     parser.add_argument("--job-id")
     parser.add_argument("--scheduler")
@@ -1235,11 +2521,45 @@ def add_metadata(parser):
     parser.add_argument("--artifact", action="append", help="artifact path or host:path pointer; repeatable")
 
 
+def add_identity_options(parser, top: bool = False) -> None:
+    """--agent/--session on a (sub)command; SUPPRESS keeps a value given before the subcommand."""
+    default = None if top else argparse.SUPPRESS
+    for flag, text in (("--agent", "descriptive agent label; not an ownership credential"),
+                       ("--session", "unique working-session ID (or RMEM_SESSION)")):
+        try:
+            parser.add_argument(flag, default=default, help=text)
+        except argparse.ArgumentError:
+            pass  # the command defines it already
+
+
+def command_problem(parser, argv) -> str:
+    """Return an error with a did-you-mean suggestion when a (nested) subcommand word is unknown."""
+    tokens, level = iter(argv), parser
+    for token in tokens:
+        choices = getattr(level, "rmem_choices", None)
+        if choices is None:
+            return ""
+        if token in ("--agent", "--session"):
+            next(tokens, None)
+            continue
+        if token.startswith(("--agent=", "--session=")):
+            continue
+        if token.startswith("-"):
+            return ""
+        if token in choices:
+            level = choices[token]
+            continue
+        close = difflib.get_close_matches(token, list(choices), n=3, cutoff=0.5)
+        hint = f" Did you mean {' or '.join(repr(c) for c in close)}?" if close else ""
+        return f"unknown command {token!r}.{hint} Commands: {', '.join(sorted(choices))}"
+    return ""
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog="rmem", description=__doc__)
-    parser.add_argument("--agent", help="descriptive agent label; not an ownership credential")
-    parser.add_argument("--session", help="unique working-session ID (or RMEM_SESSION)")
+    add_identity_options(parser, top=True)
     commands = parser.add_subparsers(dest="command", required=True)
+    parser.rmem_choices = commands.choices
     p = commands.add_parser("init", help="create a new empty, self-contained hub")
     p.add_argument("directory")
     p.add_argument("--project-name")
@@ -1247,34 +2567,59 @@ def build_parser():
     p = commands.add_parser("status", help="bounded current state, ownership, and recent events")
     p.add_argument("-n", type=count, default=8)
     p.add_argument("--thread", type=identifier)
+    p.add_argument("--include-locks", action="store_true", help="also list claim/release events")
+    p.add_argument("--all", action="store_true", help="also list sealed and archived threads")
     p.set_defaults(fn=cmd_status)
-    p = commands.add_parser("recent", help="bounded, streaming ledger query")
-    p.add_argument("-n", type=count, default=20)
-    p.add_argument("--kind")
+    p = commands.add_parser("recent", help="bounded ledger query; claim/release events are hidden unless --include-locks")
+    p.add_argument("-n", type=queries.limit, default=20, help=f"events to show (at most {queries.QUERY_MAX})")
+    p.add_argument("--kind", type=queries.kind_list, help="one kind or a comma-separated list, such as exp,finding")
     p.add_argument("--thread", type=identifier)
-    p.add_argument("--grep", type=regex)
+    p.add_argument("--grep", type=regex, help="regular expression matched against the whole event JSON")
+    p.add_argument("--since", help="ingested at or after: local time (2026-10-14 09:00), ISO 8601 with offset, or an age such as 6h or 3d")
+    p.add_argument("--until", help="ingested at or before (same formats as --since)")
+    p.add_argument("--after-seq", type=queries.sequence,
+                   help="events after the event with this sequence number, in ledger order, oldest first, to page forward")
+    p.add_argument("--after-pos", type=queries.sequence, metavar="POSITION",
+                   help="events after this ledger line position; next-page notes give it when stored sequences repeat")
+    p.add_argument("--from-session", metavar="SESSION", help="only this session's events")
+    p.add_argument("--other-sessions", action="store_true", help="hide your own session's events")
+    p.add_argument("--include-locks", action="store_true", help="also show claim/release events")
     p.set_defaults(fn=cmd_recent)
     p = commands.add_parser("catalog", help="bounded research-record index; literal query, no whole-repository search")
-    p.add_argument("-n", type=count, default=10)
-    p.add_argument("--query", help="literal case-insensitive text query")
+    p.add_argument("-n", type=queries.limit, default=10, help=f"rows to show (at most {queries.QUERY_MAX})")
+    p.add_argument("--query", action="append", help="literal case-insensitive text; repeat for alternatives (OR)")
+    p.add_argument("--regex", type=regex, help="regular expression; combined with --query as an alternative (OR)")
     p.add_argument("--thread", type=identifier)
     p.add_argument("--updates", action="store_true", help="show individual updates instead of latest per experiment")
     p.set_defaults(fn=cmd_catalog)
     p = commands.add_parser("show", help="bounded research record and exact evidence pointers")
     p.add_argument("identifier", help="exact experiment ID, event UUID, or unambiguous historical import source ID")
-    p.add_argument("--section", choices=("all", "record", "sources", "history"), default="all")
+    p.add_argument("--section", choices=("all", "record", "sources", "history"), help="default: all")
+    p.add_argument("--field", help="read one field completely in pages: note, body, cmd, research, sources, "
+                   "metrics, a dotted path such as research.recipe, or event for the whole event")
+    p.add_argument("--body", action="store_true", help="short for --field body (the --note-file text)")
+    p.add_argument("--page", type=queries.page_number, help="page of the field to show (default 1)")
+    p.add_argument("--page-size", type=queries.page_number,
+                   help=f"characters per page ({queries.PAGE_MIN} to {queries.PAGE_MAX}; default {queries.PAGE_DEFAULT})")
+    p.add_argument("--format", choices=("json", "text"), default="json", help="text prints the page as plain text")
     p.set_defaults(fn=cmd_show)
     p = commands.add_parser("highlight", help="immutable milestone/version/finding/correction snapshots")
     highlight_commands = p.add_subparsers(dest="highlight_command", required=True)
-    h = highlight_commands.add_parser("create", help="copy selected small repository files; requires project-state claim")
+    p.rmem_choices = highlight_commands.choices
+    h = highlight_commands.add_parser("create", help="copy selected small repository files; refused while another session holds a live project-state lease")
     h.add_argument("spec", help="JSON specification following HIGHLIGHT_TEMPLATE.json")
+    h.add_argument("--freeze-ledger", action="store_true",
+                   help="also copy the whole ledger prefix (0.3 format, at most 16 MiB) instead of line digests")
+    h.set_defaults(fn=cmd_highlight)
+    h = highlight_commands.add_parser("index", help=f"print (or --write) {highlights.INDEX_NAME}, newest first")
+    h.add_argument("--write", action="store_true", help=f"save {highlights.INDEX_NAME} in the hub")
     h.set_defaults(fn=cmd_highlight)
     h = highlight_commands.add_parser("list", help="bounded time or literal-text lookup")
     h.add_argument("-n", type=count, default=10)
     h.add_argument("--query")
     h.add_argument("--time-field", choices=("occurred_at", "captured_at"), default="occurred_at")
-    h.add_argument("--since", type=zoned_timestamp)
-    h.add_argument("--until", type=zoned_timestamp, help="inclusive cutoff; -n 1 selects latest highlight at/before it")
+    h.add_argument("--since", help="at or after: local time (2026-10-14 09:00), ISO 8601 with offset, or an age such as 3d")
+    h.add_argument("--until", help="inclusive cutoff (same formats as --since); -n 1 selects latest highlight at/before it")
     h.set_defaults(fn=cmd_highlight)
     for name in ("show", "verify", "restore"):
         h = highlight_commands.add_parser(name)
@@ -1282,33 +2627,46 @@ def build_parser():
         if name == "restore":
             h.add_argument("--destination", required=True, help="new or empty directory outside live repository and control directories")
         h.set_defaults(fn=cmd_highlight)
-    for name, function in (("claim", cmd_claim), ("release", cmd_release)):
-        p = commands.add_parser(name, help=f"{name} a thread for this working session")
-        p.add_argument("slug", type=identifier)
+    for name, function, text in (("claim", cmd_claim, "take a lease on a thread (or --resource) for this working session"),
+                                 ("release", cmd_release, "release this session's lease on a thread (or --resource)")):
+        p = commands.add_parser(name, help=text)
+        p.add_argument("slug", nargs="?", type=identifier, help="thread slug")
+        p.add_argument("--resource", type=identifier, help="lease something outside the hub, such as a shared document section")
         p.add_argument("--note")
-        p.add_argument("--force", action="store_true")
+        p.add_argument("--force", action="store_true", help="inspected recovery of a live, invalid or inconsistent claim; needs --reason")
         p.add_argument("--reason")
+        if name == "claim":
+            p.add_argument("--ttl", type=lease_hours, metavar="HOURS",
+                           help="hours the lease stays live after this session's latest ledger event (default leases.default_ttl_hours)")
+            p.add_argument("--wait", type=wait_seconds, metavar="SECONDS",
+                           help="wait up to SECONDS for another session's live lease to be released or expire")
+            p.add_argument("--takeover", action="store_true", help="take over an expired lease; needs --reason")
         p.set_defaults(fn=function)
     p = commands.add_parser("log", help="append one evidence-backed event")
     p.add_argument("--kind", default="exp", choices=("exp", "decision", "finding", "todo", "import"))
     p.add_argument("--id", type=identifier)
     p.add_argument("--thread", type=identifier)
     p.add_argument("--hyp")
-    p.add_argument("--status", choices=("planned", "running", "keep", "discard", "crash", "inconclusive", "cancelled"))
+    p.add_argument("--status", type=queries.status_value, metavar="STATUS",
+                   help="planned, running, keep, discard, crash, inconclusive or cancelled")
     p.add_argument("--metric", action="append")
     p.add_argument("--commit", help="explicit source-code revision; historical imports never infer one")
     p.add_argument("--where")
-    p.add_argument("--note")
+    p.add_argument("--note", help="one-line summary (at most 1,000 characters); longer text goes in --note-file")
+    queries.add_provenance_options(p)
     p.add_argument("--source", action="append", help="local evidence file to hash; repeatable")
-    p.add_argument("--record", help="validated structured research record JSON; requires a thread claim")
+    p.add_argument("--record", help="validated structured research record JSON; requires --thread")
     p.add_argument("--source-id")
     p.add_argument("--source-namespace")
-    p.add_argument("--event-time", help="original ISO 8601 event time with timezone; ts remains ingestion time")
+    p.add_argument("--event-time", help="when the event happened: local time (2026-10-14 09:00) or ISO 8601 with offset; "
+                   "ts remains ingestion time")
     p.add_argument("--supersedes", help="stable event/source-record pointer corrected by this event")
     add_metadata(p)
     p.set_defaults(fn=cmd_log)
     p = commands.add_parser("note", help="append a note to this session's journal")
     p.add_argument("text")
+    p.add_argument("--allow-sensitive", action="store_true",
+                   help="write the note even though it looks like a key, token or password")
     p.set_defaults(fn=cmd_note)
     p = commands.add_parser("run", help="capture a command, its starting code state, and a bounded digest")
     p.add_argument("--id", required=True, type=identifier)
@@ -1319,32 +2677,98 @@ def build_parser():
     add_metadata(p)
     p.add_argument("cmd", nargs=argparse.REMAINDER)
     p.set_defaults(fn=cmd_run)
+    p = commands.add_parser("capture", help="record an already submitted remote command (ssh, sbatch) without running it")
+    p.add_argument("--id", required=True, type=identifier)
+    p.add_argument("--thread", required=True, type=identifier)
+    p.add_argument("--status", type=queries.status_value, default="running", metavar="STATUS",
+                   help="default running; planned, running, keep, discard, crash, inconclusive or cancelled")
+    p.add_argument("--note", help="one-line summary; longer text goes in --note-file")
+    queries.add_provenance_options(p)
+    add_metadata(p)
+    p.add_argument("submitted", nargs=argparse.REMAINDER, help="the command as submitted, after --")
+    p.set_defaults(fn=cmd_capture, kind="exp")
     p = commands.add_parser("check", help="check caps, claim metadata, and ledger integrity")
     p.add_argument("--records", action="store_true", help="only ledger/record integrity and structured-record coverage")
-    p.add_argument("--require-records-since", type=zoned_timestamp,
-                   help="require records on semantic events ingested at or after this zoned ISO timestamp")
+    p.add_argument("--require-records-since", metavar="TIME",
+                   help="require records on semantic events ingested at or after this time (same formats as recent --since)")
     p.set_defaults(fn=cmd_check)
     p = commands.add_parser("link", help="atomically link a project while preserving its existing instructions")
     p.add_argument("project_dir")
     p.add_argument("--replace", action="store_true", help="explicitly replace a pointer to a different hub")
+    p.add_argument("--canonical", action="store_true",
+                   help="write this hub's absolute path into .rmem and keep .rmem out of Git (per checkout and device)")
     p.set_defaults(fn=cmd_link)
     p = commands.add_parser("sync", help="commit only memory files; never push")
     p.add_argument("-m", "--message")
+    p.add_argument("--embedded", action="store_true",
+                   help="commit only hub files into the repository that contains the hub, without touching your index or files")
+    p.add_argument("--per-event", action="store_true", help="with --embedded: one commit per new ledger event, dated by the event")
+    p.add_argument("--dry-run", action="store_true", help="with --embedded: show the commits without creating them")
+    p.add_argument("--include-untracked", action="store_true",
+                   help="with --embedded: also commit untracked hub files that rmem does not write, after you reviewed them")
     p.set_defaults(fn=cmd_sync)
+    p = commands.add_parser("version", help="kit version, hub manifest, and locally changed kit files (read-only)")
+    p.set_defaults(fn=cmd_version)
+    p = commands.add_parser("doctor", help="diagnose access, identity sources, config and plugins (read-only)")
+    p.set_defaults(fn=cmd_doctor)
+    core_parsers = dict(commands.choices)
+    for entry in feature_modules():
+        call_hook(entry, "register", commands, core)
+        if entry.origin == "plugin":
+            for name, original in core_parsers.items():
+                if commands.choices.get(name) is not original:
+                    commands.choices[name] = original
+                    record_broken(entry, f"register tried to replace the core command {name!r}; kept the core command")
+    # WHY: identity options are accepted before or after any subcommand, including nested ones.
+    for subparser in commands.choices.values():
+        add_identity_options(subparser)
+        for nested in getattr(subparser, "rmem_choices", {}).values():
+            add_identity_options(nested)
     return parser
 
 
-def main():
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    hub = plugin_hub(argv)
+    if hub is not None:
+        try:
+            load_plugins(hub)
+        except (OSError, UnicodeError, ValueError) as exc:
+            BROKEN_MODULES["plugins/"] = {"origin": "plugin", "error": f"plugins not loaded: {clipped(exc, 300)}"}
     parser = build_parser()
-    args = parser.parse_args()
+    problem = command_problem(parser, argv)
+    if problem:
+        parser.print_usage(sys.stderr)
+        print(f"rmem: error: {problem}", file=sys.stderr)
+        return 2
+    args = parser.parse_args(argv)
     try:
         return args.fn(args) or 0
     except (RmemError, OSError, UnicodeError, ValueError) as exc:
-        print("rmem: " + clipped(exc, 1800), file=sys.stderr)
+        hint = ("; run `rmem doctor` to see this process's access to the hub"
+                if isinstance(exc, OSError) and exc.errno in READ_ONLY_ERRNOS else "")
+        print("rmem: " + clipped(exc, 1800) + hint, file=sys.stderr)
         return 2
     except KeyboardInterrupt:
         print("rmem: interrupted", file=sys.stderr)
         return 130
+
+
+# The stable surface feature modules and plugins use (see bin/plugins/README.md).
+core = SimpleNamespace(
+    RmemError=RmemError, find_hub=find_hub, validate_hub=validate_hub, hub_lock=hub_lock,
+    events_locked=events_locked, append_locked=append_locked, actor=actor, one_line=one_line,
+    identifier=identifier, count=count, regex=regex, safe_path=safe_path, atomic_write=atomic_write,
+    open_regular=open_regular, bounded_lines=bounded_lines, text_chars=text_chars, text_usage=text_usage,
+    text_excerpt=text_excerpt, Output=Output, clipped=clipped, fmt_event=fmt_event, now=now,
+    load_config=load_config, display_time=display_time, parse_user_time=parse_user_time,
+    consistency_preflight=consistency_preflight, authorize_thread_write=authorize_thread_write,
+    describe_owner=describe_owner, thread_visible=thread_visible, run_git=run_git,
+    provenance=provenance, source_records=source_records, kit_root=kit_root, kit_version=kit_version,
+    add_identity_options=add_identity_options, file_sha256=file_sha256, discover_hub=discover_hub,
+    load_claim=load_claim, lease_entries=lease_entries, lease_status=lease_status, held_leases=held_leases,
+    section_lines=section_lines, event_problem=event_problem, kit_files=KIT_FILES, kit_helpers=KIT_HELPERS,
+    linked_projects=linked_projects)
 
 
 if __name__ == "__main__":

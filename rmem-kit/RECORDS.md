@@ -22,6 +22,7 @@ python3 .research-memory/bin/rmem catalog --thread baseline --updates -n 10
 python3 .research-memory/bin/rmem show E042 --section record
 python3 .research-memory/bin/rmem show EVENT_UUID --section sources
 python3 .research-memory/bin/rmem show E042 --section history
+python3 .research-memory/bin/rmem show E042 --field research --page 2
 python3 .research-memory/bin/rmem check --records
 ```
 
@@ -30,7 +31,9 @@ source code, datasets, model files, full logs, or remote hosts. Its default view
 keeps the latest update visible even when the query matched an older claim.
 Use `--updates` to select individual historical updates. `show` accepts exact IDs
 and returns bounded valid JSON; oversized records retain paths for a narrower
-read rather than silently dropping scientific fields.
+read rather than silently dropping scientific fields, and `--field NAME --page N`
+reads any one field completely in pages. Several `--query` texts and a `--regex`
+are alternatives that share one result budget.
 
 ## Identity, sequence, and training progress
 
@@ -112,6 +115,88 @@ python3 .research-memory/bin/rmem check --records --require-records-since 2026-0
 Replace this example cutoff with the actual adoption date. Missing records on
 exp/finding/decision/todo events written after it cause a nonzero exit. This does
 not install a Git hook, CI job, automation, or blanket blocking policy.
+
+## Note bodies and command text
+
+`--note` is the one-line summary that list views show (at most 1,000
+characters). Put longer or multi-line text in a file and pass `--note-file PATH`,
+or `--note-file -` to read it from standard input:
+
+```bash
+python3 .research-memory/bin/rmem log --id E042 --thread baseline --status keep \
+  --note 'Seeds 1 to 3 agree; readout in the body' --note-file /tmp/e042-readout.md
+python3 .research-memory/bin/rmem show E042 --field body
+python3 .research-memory/bin/rmem show E042 --body --page 2 --format text
+```
+
+- The text is stored once under `notes/<yyyy-mm>/<first 16 hex digits of its
+  SHA-256>.md` (UTC month); logging an identical text again reuses that file.
+  The event keeps `body_path`, `body_sha256` and `body_chars`. Without `--note`,
+  the summary is the first nonempty line of the body (up to 300 characters).
+- Every argument is checked before the hub lock is taken, so a refused `log`
+  leaves no ledger line and no file. The body is written under the lock just
+  before the append; when the append is refused, the file is removed again.
+- Note files are memory: `rmem sync` commits them with the ledger, and
+  `.gitattributes` keeps their bytes exact. They are never edited. `rmem check`
+  fails when one no longer matches its hash, warns when one is missing, and
+  reports files that no event names as `info:`.
+- `show ID --field body` (or `--body`) pages the text and reports `verified`
+  against the recorded hash. The limit is `notes.body_max_chars` (200,000
+  characters by default; see [CONFIG.md](CONFIG.md)).
+
+## Provenance fields
+
+`log` and `capture` accept these optional fields. All of them are plain event
+fields; none is required, and older events simply lack them.
+
+| Option | Event field | Meaning |
+|---|---|---|
+| `--cmd TEXT`, `--cmd-file PATH` | `cmd`, or `cmd_path`, `cmd_sha256`, `cmd_chars` | exact command text; text over 4,000 characters is stored like a note body and read with `show ID --field cmd` |
+| `--workdir TEXT` | `workdir` | working directory on the host where the command ran |
+| `--code-ref HOST:PATH@REVISION` | `code_ref`, `commit` | code that ran elsewhere; the revision after the last `@` fills `commit` unless `--commit` is given |
+| `--set KEY=VALUE` (repeatable) | `fields` | structured values such as `seed=42` or `data.sha=abc123`; plain decimal numbers are stored as numbers, anything else (including `007`) as text |
+| `--no-provenance` | `provenance.skipped` | skip the local Git probe because the code ran on another machine |
+
+Without `--commit`, `log` probes the Git checkout of the current directory and
+records `provenance` (repository root, `HEAD`, dirty state and a status hash).
+When the hub lives inside that repository, the hub directory is left out of the
+dirty check and named in `provenance.dirty_excludes`, so memory writes no longer
+mark the code dirty. With `--code-ref` the probe stays in `provenance` but does
+not fill `commit`. A `--host` result that would carry this machine's commit gets
+a hint to use `--code-ref` or `--no-provenance` instead.
+
+## Capture a submitted command
+
+`rmem run` wraps a local foreground process. For a command already submitted
+through ssh, sbatch or another scheduler, record the exact command without
+running anything:
+
+```bash
+python3 .research-memory/bin/rmem capture --id E043 --thread baseline --host cluster \
+  --job-id 123 --scheduler slurm --workdir /scratch/e043 \
+  --code-ref cluster:/scratch/code@8566a1d -- sbatch --array=0-3 train.sh
+```
+
+The event has `kind` `exp`, `status` `running` (or the given `--status`),
+`captured: true`, the exact `argv`, and its shell rendering in `cmd`; `--cmd` or
+`--cmd-file` can replace `-- COMMAND`. Its evidence level defaults to `reported`.
+Capture writes to the thread like `log --thread`. A captured command was
+submitted; it has not been observed to run or succeed, so log the outcome later.
+
+## Secrets never go into the ledger
+
+The ledger is append-only and note files are never edited; once a hub is
+committed and pushed, a line cannot be redacted without rewriting Git history.
+So `log` and `capture` refuse a `--note`, `--hyp`, `--where`, command text
+(`--cmd`, `--cmd-file`, the captured `argv`), `--note-file` body or `--set`
+value that looks like a key, token or password (private keys, AWS, GitHub,
+OpenAI, Anthropic, Hugging Face and Slack tokens, and assignments such as
+`HF_TOKEN=…` or `WANDB_API_KEY=…`), and `note` refuses such journal text. The
+refusal names the field, never the value. Refer to a secret by its variable
+name (`$HF_TOKEN`) instead; `--allow-sensitive` records the text anyway when you
+have checked that it is not a secret. `rmem run` still runs the command as
+given but records such an argument as `NAME=<redacted>` (or `<redacted>`) and
+adds `redacted: ["argv"]` to its events.
 
 ## Portable source locations
 

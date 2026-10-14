@@ -1,8 +1,9 @@
-runs/
-claims/
-.rmem.lock
-.rmem-lock*
+/runs/
+/claims/
+/.rmem.lock
+/.rmem-lock*
 *.tmp
 .DS_Store
 __pycache__/
-local-roots.json
+/local-roots.json
+/ledger.jsonl.bak-*

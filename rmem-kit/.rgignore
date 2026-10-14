@@ -1,0 +1,6 @@
+# Recovery starts from `rmem status`, `catalog` and `show`, not a whole-tree search.
+# These folders hold frozen history and raw run output; search them deliberately
+# with an explicit path or `rg --no-ignore`.
+/highlights/
+/history/
+/runs/

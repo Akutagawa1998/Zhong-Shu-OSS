@@ -1,0 +1,37 @@
+{
+  "_doc": "rmem hub configuration. Every key is optional: a missing key uses the kit default shown here. Keys that start with an underscore are comments. Caps count characters, not bytes. See CONFIG.md for what each key does.",
+  "schema_version": 1,
+  "caps": {
+    "state_max_lines": 120,
+    "state_max_chars": 8000,
+    "thread_max_lines": 80,
+    "thread_max_chars": 9000,
+    "output_max_chars": 16000,
+    "soft_ratio": 0.7
+  },
+  "display_tz": null,
+  "roles": {},
+  "leases": {
+    "default_ttl_hours": 12
+  },
+  "requests": {
+    "ack_warn_days": 2
+  },
+  "staleness": {
+    "events_after_edit": 20
+  },
+  "git": {
+    "uncommitted_warn_hours": 24
+  },
+  "storage": {
+    "hub_warn_mb": 200,
+    "file_warn_mb": 5
+  },
+  "notes": {
+    "body_max_chars": 200000
+  },
+  "resume": {
+    "max_chars": 6000,
+    "recent_events": 8
+  }
+}

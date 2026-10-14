@@ -86,7 +86,7 @@ def validate_record(r):
             if a['availability'] in {'observed_local','verified_remote'}:require(a['checked_at'] is not None,'observed artifact needs checked_at')
         require(bool(r['artifacts']) or bool(r['gaps']),'artifact locations or explicit gaps required')
         encoded=json.dumps(r,ensure_ascii=False,allow_nan=False)
-        require(len(encoded)<=RECORD_LIMIT,'record exceeds48k; use evidence pointers')
+        require(len(encoded)<=RECORD_LIMIT,f'record exceeds {RECORD_LIMIT:,} characters; move detail into evidence files and cite them')
     except (ValueError,TypeError,KeyError,OverflowError) as e:
         return str(e)
     return ''
@@ -145,22 +145,38 @@ def bounded(view, list_key=None):
             view[list_key].pop();view['truncated']=True
         return view
     if len(json.dumps(view,ensure_ascii=False))<=VIEW_LIMIT:return view
-    return {'error':'Selected view exceeds12000characters; use --section record|sources|history or exact event_id.',
+    return {'error':f'Selected view exceeds {VIEW_LIMIT:,} characters; use --section record, sources or history, an exact event_id, or read one field in pages with --field NAME --page N (for example --field research).',
             'identifier':view.get('identifier'),'available_events':view.get('history',[])[:5],
             'record_file_paths':view.get('record_file_paths',[]), 'source_file_paths':view.get('source_file_paths',[]),
             'limits':'No scientific fields were silently dropped. Read the named small record or a narrower section.'}
 
 
+def text_matcher(args):
+    """(hits, several): hits(text) names the --query texts (and 'regex') that match; None without text filters.
+    Several filters are alternatives (OR) that share one -n and one output budget."""
+    queries=args.query if isinstance(args.query,list) else [args.query] if args.query else []
+    pattern=getattr(args,'regex',None)
+    if not queries and pattern is None:return None,False
+    folded=[(q,q.casefold()) for q in queries]
+    def hits(text):
+        lowered=text.casefold()
+        found=[q for q,f in folded if f in lowered]
+        if pattern is not None and pattern.search(text):found.append('regex')
+        return found
+    return hits,len(queries)+(pattern is not None)>1
+
+
 def catalog_view(hub, events, args):
-    reviewed=cards(hub);query=(args.query or '').casefold();groups={};selected=[]
+    reviewed=cards(hub);matcher,several=text_matcher(args);groups={};selected=[]
     if any(e.get('kind')=='CORRUPT' for e in events):raise ValueError('Ledger is corrupt; run check before recovery')
     for ordinal,e in enumerate(events,1):
         if e.get('kind') not in SEMANTIC_KINDS:continue
         match=matching_card(e,reviewed)
         related=[r for _,r in reviewed if r['experiment_id']==e.get('id') and e.get('event_id') not in r['source_event_ids']]
         haystack=json.dumps({'id':e.get('id'),'event_id':e.get('event_id'),'source_id':e.get('source_id'),
-                            'source_namespace':e.get('source_namespace'),'note':e.get('note'),'record':match,'related_records':related},ensure_ascii=False).casefold()
-        hit=(not args.thread or e.get('thread')==args.thread) and (not query or query in haystack)
+                            'source_namespace':e.get('source_namespace'),'note':e.get('note'),'record':match,'related_records':related},ensure_ascii=False)
+        found=matcher(haystack) if matcher else []
+        hit=(not args.thread or e.get('thread')==args.thread) and (not matcher or bool(found))
         row={'sequence':e.get('sequence',ordinal),'sequence_source':'stored' if 'sequence' in e else 'derived_current_ledger_position',
              'event_id':e.get('event_id'),'experiment_id':e.get('id'),'source_namespace':e.get('source_namespace'),
              'source_id':e.get('source_id'),
@@ -168,31 +184,34 @@ def catalog_view(hub, events, args):
              'summary':(e.get('research',{}).get('summary') or e.get('note') or '')[:320],
              'record':record_summary(match),'structured':bool(match),
              'related_records':[{'as_of':r['as_of'],'source_event_ids':r['source_event_ids']} for r in related]}
+        if 'body_chars' in e:row['body_chars']=e['body_chars']
         key=(e.get('source_namespace'),e.get('id') or e.get('event_id'))
-        groups.setdefault(key,[]).append((row,hit))
-        if args.updates and hit:selected.append(row)
+        groups.setdefault(key,[]).append((row,hit,found))
+        if args.updates and hit:selected.append(dict(row,matched_by=found) if several else row)
     if not args.updates:
         for history in groups.values():
-            matches=[r for r,hit in history if hit]
+            matches=[(r,found) for r,hit,found in history if hit]
             if not matches:continue
             # Pick latest by immutable append order BEFORE searching. A keyword
             # found only in old positive evidence must not hide a retraction.
             row=dict(history[-1][0])
-            if query or args.thread:
-                row['matched_event_ids']=[r['event_id'] for r in matches][-5:]
+            if matcher or args.thread:
+                row['matched_event_ids']=[r['event_id'] for r,_ in matches][-5:]
                 row['latest_update_matches_filter']=history[-1][1]
+            if several:row['matched_by']=list(dict.fromkeys(x for _,found in matches for x in found))
             selected.append(row)
     represented={key[1] for key in groups}
     for path,r in reviewed:
         if r['experiment_id'] in represented:continue
         refs=[e for e in events if e.get('event_id') in r['source_event_ids']]
         if args.thread and not any(e.get('thread')==args.thread for e in refs):continue
-        if query and query not in json.dumps(r,ensure_ascii=False).casefold():continue
+        found=matcher(json.dumps(r,ensure_ascii=False)) if matcher else []
+        if matcher and not found:continue
         selected.append({'sequence':None,'sequence_source':'reviewed_card_not_new_execution',
              'event_id':None,'source_event_ids':r['source_event_ids'],'experiment_id':r['experiment_id'],
              'updated':r['as_of'],'thread':refs[-1].get('thread') if refs else None,'status':'reviewed_snapshot',
              'summary':r['summary'][:320],'record':[{'task_type':r['task_type'],'steps':r['steps'],'as_of':r['as_of'],'gap_count':len(r['gaps'])}],
-             'record_file':str(path.relative_to(hub)),'structured':True})
+             'record_file':str(path.relative_to(hub)),'structured':True,**({'matched_by':found} if several else {})})
     # Zoned timestamps are compared as instants, solely for display order.
     selected.sort(key=lambda row:timestamp(row['updated']))
     view={'rows':list(reversed(selected))[:args.n],'matching_count':len(selected),'truncated':len(selected)>args.n,
@@ -237,7 +256,8 @@ def source_locations(hub, event):
     return mapped
 
 
-def show_view(hub, events, identifier, section):
+def event_history(events, identifier):
+    """(history, exact, historical_source_lookup) for an event UUID, experiment ID or historical import source ID."""
     if any(e.get('kind')=='CORRUPT' for e in events):raise ValueError('Ledger is corrupt; run check before recovery')
     exact=[e for e in events if e.get('event_id')==identifier]
     history=exact or [e for e in events if e.get('id')==identifier]
@@ -249,6 +269,14 @@ def show_view(hub, events, identifier, section):
         if imports:
             history=imports
             historical_source_lookup=True
+    if history:
+        if len(exact)>1:raise ValueError('Duplicate event ID; repair ledger before recovery')
+        if not exact and len({e.get('source_namespace') for e in history})>1:raise ValueError('Experiment ID spans multiple source namespaces; choose exact event_id from catalog')
+    return history, exact, historical_source_lookup
+
+
+def show_view(hub, events, identifier, section):
+    history, exact, historical_source_lookup = event_history(events, identifier)
     if not history:
         matches=[(p,r) for p,r in cards(hub) if r['experiment_id']==identifier]
         if not matches:raise ValueError('Unknown exact experiment/event ID; use catalog --query. No historical whole-repository fallback.')
@@ -262,8 +290,6 @@ def show_view(hub, events, identifier, section):
         if section in {'all','sources'}:
             view['sources']=[{'record_file':str(p.relative_to(hub)),'artifacts':r['artifacts']} for p,r in matches]
         return bounded(view)
-    if len(exact)>1:raise ValueError('Duplicate event ID; repair ledger before recovery')
-    if not exact and len({e.get('source_namespace') for e in history})>1:raise ValueError('Experiment ID spans multiple source namespaces; choose exact event_id from catalog')
     latest=history[-1];reviewed=cards(hub)
     match=matching_card(latest,reviewed)
     hs=[{'event_id':e.get('event_id'),'time':e.get('ts'),'kind':e.get('kind'),'status':e.get('status'),'supersedes':e.get('supersedes')} for e in history]
@@ -286,6 +312,8 @@ def show_view(hub, events, identifier, section):
     if section in {'all','sources'}:
         result['sources']=source_locations(hub,latest);result['artifacts']=latest.get('artifacts',[])
     if section=='all':result['event']={k:v for k,v in latest.items() if k not in {'sources','research'}}
+    stored=[p for p in ('body','cmd') if latest.get(p+'_path')]
+    if stored:result['full_text']=[f"rmem show {latest.get('event_id') or identifier} --field {p}" for p in stored]
     view=bounded(result)
     if historical_source_lookup and 'lookup_kind' not in view:
         for key in ('lookup_kind','original_source_id','source_namespace','ingestion_event_id','event_id'):

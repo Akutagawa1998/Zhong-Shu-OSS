@@ -1,2 +1,4 @@
 # Conflicting histories require evidence reconciliation, not automatic union.
 ledger.jsonl text eol=lf
+# Note bodies are content-addressed (notes/<month>/<sha256 prefix>.md): keep their bytes exact.
+notes/** -text
