@@ -134,6 +134,7 @@ class FoundationTests(unittest.TestCase):
 
     def test_plugin_adds_command_kinds_status_and_check_lines(self):
         (self.hub / "bin/plugins/demo.py").write_text(PLUGIN)
+        self.env["RMEM_TRUSTED_PLUGIN_HUB"] = str(self.hub)
         result = self.call("demo", "--to", "alice", "--session", "session-after")
         self.assertIn("demo_note", result.stdout)
         self.assertEqual(self.events()[-1]["to"], "alice")
@@ -156,6 +157,7 @@ class FoundationTests(unittest.TestCase):
         self.assertIn("event to must be a string", failed)
 
     def test_plugins_others_could_write_are_never_run(self):
+        self.env["RMEM_TRUSTED_PLUGIN_HUB"] = str(self.hub)
         marker = self.root / "PWNED"
         payload = f"open({str(marker)!r}, 'a').write('plugin ran\\n')\n"
         # A hub planted in a directory every user can write to, above the victim's working directory.
@@ -173,6 +175,7 @@ class FoundationTests(unittest.TestCase):
         shared.chmod(0o777)
         self.addCleanup(shared.chmod, 0o755)
         unpointed = {k: v for k, v in self.env.items() if k != "RMEM_HUB"}
+        unpointed["RMEM_TRUSTED_PLUGIN_HUB"] = str(evil)
         for args in (("--help",), ("version",), ("doctor",), ("status",), ("recent",)):
             subprocess.run([sys.executable, str(CLI), *args], cwd=work, env=unpointed, capture_output=True,
                            text=True, timeout=30)
@@ -192,10 +195,15 @@ class FoundationTests(unittest.TestCase):
         for args in (("--help",), ("version",), ("init", self.root / "fresh")):
             self.call(*args)
         self.assertFalse(marker.exists())
+        for trust in ("", str(self.root / "fresh"), "hub"):
+            env = {**self.env, "RMEM_TRUSTED_PLUGIN_HUB": trust}
+            self.call("status", env=env)
+            self.assertFalse(marker.exists())
         self.call("status")
         self.assertTrue(marker.exists())
 
     def test_broken_plugins_are_skipped_and_reported_without_breaking_reads(self):
+        self.env["RMEM_TRUSTED_PLUGIN_HUB"] = str(self.hub)
         plugins = self.hub / "bin/plugins"
         (plugins / "broken.py").write_text("raise RuntimeError('boom at import')\n")
         (plugins / "syntax.py").write_text("def broken(:\n")

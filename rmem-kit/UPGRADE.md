@@ -93,33 +93,9 @@ hub's code files (or, failing that, any file); if nothing matches it is
 "unknown", and every file that differs from the kit is a conflict. After
 `--apply`, the hub has a manifest and later upgrades use it.
 
-## `KIT_HISTORY.json` and how to regenerate it
+## Historical kit hashes
 
-`KIT_HISTORY.json` lists, for each released tag, the SHA-256 of every file under
-`rmem-kit/` at that tag, keyed by its path in an installed hub (`rmem-kit/X` is
-`X`). It only serves hubs without a manifest, so it lists released versions
-(0.2.0, 0.2.1, 0.3.0, 0.3.1) and is regenerated when a release is tagged. Run this
-with bash from the repository root after adding the new tag to the list:
-
-```bash
-{
-  printf '{\n  "_doc": "SHA-256 of every file under rmem-kit/ at each released kit tag, keyed by its path in an installed hub (rmem-kit/X is X). rmem upgrade uses it to recognize unchanged kit files in hubs installed before 0.4.0. Regenerate with the command in UPGRADE.md.",\n  "schema_version": 1,\n  "versions": [\n'
-  sep=''
-  for tag in v0.2.0 v0.2.1 v0.3.0 v0.3.1; do
-    printf '%s    {"version": "%s", "tag": "%s", "files": {\n' "$sep" "${tag#v}" "$tag"
-    git ls-tree -r --name-only "$tag" -- rmem-kit | LC_ALL=C sort | {
-      first=1
-      while IFS= read -r path; do
-        sum=$(git show "${tag}:${path}" | shasum -a 256 | cut -c1-64)
-        [ "$first" = 1 ] || printf ',\n'
-        first=0
-        printf '      "%s": "%s"' "${path#rmem-kit/}" "$sum"
-      done
-    }
-    printf '\n    }}'
-    sep=',
-'
-  done
-  printf '\n  ]\n}\n'
-} > rmem-kit/KIT_HISTORY.json
-```
+`KIT_HISTORY.json` preserves the hashes from kit versions 0.2.0 through 0.4.0.
+These hashes identify unmodified kit files in older installations without a
+manifest. Keep the historical entries when making future releases. Current
+installs record their own baseline in `.kit-manifest.json`.

@@ -213,6 +213,25 @@ class EmbeddedGitTests(unittest.TestCase):
         self.assertEqual(self.git("log", "-1", "--format=%s"), "Hub: exp E2")
         self.assertIn("Hub: exp E3", self.rmem("sync", "--embedded", "--per-event").stdout)
 
+    def test_embedded_sync_checks_modified_blobs_and_keeps_user_staging(self):
+        self.git("add", "code.py")
+        self.append({"ts": ago(minutes=1), "kind": "exp", "id": "E1"})
+        value = "fixture" + "-123456"
+        state = self.hub / "STATE.md"
+        original = state.read_text()
+        state.write_text(original + f'\npassword = "{value}"\n')
+        head = self.head()
+        index = (self.repo / ".git/index").read_bytes()
+        for flags in ((), ("--dry-run", "--per-event")):
+            refused = self.rmem("sync", "--embedded", *flags, ok=False).stderr
+            self.assertIn("STATE.md (the content looks like", refused)
+            self.assertNotIn(value, refused)
+            self.assertEqual(self.head(), head)
+            self.assertEqual((self.repo / ".git/index").read_bytes(), index)
+        state.write_text(original + "\nSafe summary.\n")
+        self.rmem("sync", "--embedded", "--per-event")
+        self.assertIn("Safe summary.", self.git("show", "HEAD:.research-memory/STATE.md"))
+
     def test_dry_run_changes_nothing_in_the_repository(self):
         self.append({"ts": ago(hours=2), "kind": "exp", "id": "E1"}, {"ts": ago(hours=1), "kind": "exp", "id": "E2"})
 

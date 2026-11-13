@@ -74,7 +74,7 @@ and `session start` itself. `status` shows the same warning at the top.
 To continue after a fork, use a new session and link the old one:
 
 ```bash
-rmem session start --parent claude-034dbdbb-9890-4a67-8aef-ead70efd6013   # omit --session to derive this conversation's own ID
+rmem session start --parent claude-00000000-0000-4000-8000-000000000001   # omit --session to derive this conversation's own ID
 ```
 
 The refusal names both full conversation IDs. When the refused session is the one

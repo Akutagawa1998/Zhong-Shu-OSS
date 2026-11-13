@@ -4,11 +4,16 @@ Put project-specific extensions here instead of editing kit files. The kit's
 `bin/` files are recorded in `.kit-manifest.json`; `rmem check` warns when one
 of them changes, and an upgrade can replace them. Files in this folder are yours.
 
-`rmem` imports every `bin/plugins/<name>.py` (a regular file whose name starts
+After opt-in, `rmem` imports every `bin/plugins/<name>.py` (a regular file whose name starts
 with a letter and uses only letters, digits and underscores) after its built-in
 feature modules, in name order. A plugin is ordinary Python code that runs with
 your permissions whenever `rmem` runs in this hub: review it like any script.
 Use the Python standard library only.
+
+Review the plugin files before setting `RMEM_TRUSTED_PLUGIN_HUB` to the absolute
+path of a trusted hub in your shell or agent environment. Set it only while you
+intend to run that hub's plugins. Keep the hub on a trusted revision and review
+plugin changes before using it again.
 
 Because a plugin runs as you, rmem loads it only when the hub folder, `bin/`,
 `bin/plugins/` and the file itself belong to you (or root) and neither their

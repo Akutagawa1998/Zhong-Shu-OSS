@@ -362,8 +362,9 @@ in `display_tz` (or `RMEM_TZ`, or the system zone), for example
 
 Project-specific commands, status lines, checks and event kinds go in
 `bin/plugins/<name>.py`; [bin/plugins/README.md](bin/plugins/README.md) describes
-the contract. Plugins load after the kit's own modules. A broken plugin is
-skipped and reported by `doctor` and `check`; read commands keep working.
+the contract. To enable plugins, review their source and set
+`RMEM_TRUSTED_PLUGIN_HUB` to the absolute path of that hub in your environment.
+Plugins run with your permissions, including during read commands.
 
 ## Diagnose access with doctor
 

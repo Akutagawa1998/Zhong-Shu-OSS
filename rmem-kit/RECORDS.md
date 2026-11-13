@@ -183,7 +183,7 @@ The event has `kind` `exp`, `status` `running` (or the given `--status`),
 Capture writes to the thread like `log --thread`. A captured command was
 submitted; it has not been observed to run or succeed, so log the outcome later.
 
-## Secrets never go into the ledger
+## Credential checks and run logs
 
 The ledger is append-only and note files are never edited; once a hub is
 committed and pushed, a line cannot be redacted without rewriting Git history.
@@ -197,6 +197,8 @@ name (`$HF_TOKEN`) instead; `--allow-sensitive` records the text anyway when you
 have checked that it is not a secret. `rmem run` still runs the command as
 given but records such an argument as `NAME=<redacted>` (or `<redacted>`) and
 adds `redacted: ["argv"]` to its events.
+Child-process output is stored in local run logs. Keep those logs private and
+review them before sharing.
 
 ## Portable source locations
 

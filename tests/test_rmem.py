@@ -376,6 +376,26 @@ class RmemTests(unittest.TestCase):
         hook.chmod(0o755)
         self.call("sync", ok=False)
 
+    def test_standalone_sync_checks_the_snapshot_and_preserves_staging_on_refusal(self):
+        self.git_init()
+        self.call("sync")
+        old = self.git("rev-parse", "HEAD")
+        state = self.hub / "STATE.md"
+        state.write_text("# Safe staged state\n")
+        self.git("add", "STATE.md")
+        index = (self.hub / ".git/index").read_bytes()
+        value = "fixture" + "-123456"
+        state.write_text(f'# Draft\npassword = "{value}"\n')
+        refused = self.call("sync", ok=False).stderr
+        self.assertIn("STATE.md (the content looks like", refused)
+        self.assertNotIn(value, refused)
+        self.assertEqual(self.git("rev-parse", "HEAD"), old)
+        self.assertEqual((self.hub / ".git/index").read_bytes(), index)
+        self.assertEqual(self.git("show", ":STATE.md").strip(), "# Safe staged state")
+        state.write_text("# Safe final state\n")
+        self.call("sync")
+        self.assertEqual(self.git("show", "HEAD:STATE.md").strip(), "# Safe final state")
+
     def test_metadata_notes_and_filtered_queries(self):
         self.claim()
         self.call("note", "remember this")

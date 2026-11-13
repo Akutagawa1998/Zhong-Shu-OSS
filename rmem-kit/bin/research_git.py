@@ -351,44 +351,42 @@ def path_names(paths, limit=NAME_LIMIT) -> str:
     return shown + (f" and {len(paths) - limit} more" if len(paths) > limit else "")
 
 
-def new_file_problems(repo, paths, core, config) -> list:
-    """'path (reason)' for new files that must not be committed without a person's review: symlinks,
-    secret-looking names or contents, and files above storage.file_warn_mb. Frozen highlight copies and
-    kit files were checked when they were written and are skipped."""
+def check_staged_files(repo, changes, config, env, *, limit_new_files=False):
+    """Check the exact blobs in the proposed index, including changes to tracked files."""
     limit = config["storage"]["file_warn_mb"] * 1024 * 1024
+    entries = index_entries(repo, env)
     problems = []
-    for path in paths:
-        relative = path[len(repo.prefix):]
-        full = repo.top / path
-        reviewed = relative.startswith("highlights/") or relative.startswith("bin/") or relative in core.kit_files
-        try:
-            if full.is_symlink():
-                problems.append(f"{path} (a symlink)")
-                continue
-            if highlights.SECRET_NAME.search(full.name):
-                problems.append(f"{path} (the name looks like a secret or key file)")
-                continue
-            if reviewed:
-                continue
-            size = full.stat().st_size
+    for status, path in changes:
+        if status == "D":
+            continue
+        mode, blob = entries[path]
+        if mode not in ("100644", "100755"):
+            problems.append(f"{path} (only regular files can be synced)")
+            continue
+        relative = Path(path[len(repo.prefix):])
+        if any(highlights.SECRET_NAME.search(part) for part in relative.parts):
+            problems.append(f"{path} (the name looks like a secret or key file)")
+            continue
+        if limit_new_files and status == "A" and relative.parts[0] != "highlights":
+            size = int(output(git(repo.top, "cat-file", "-s", blob, env=env)))
             if size > limit:
                 problems.append(f"{path} ({size / 1048576:.1f} MB, above storage.file_warn_mb "
                                 f"{config['storage']['file_warn_mb']:g})")
                 continue
-            data = full.read_bytes()
-        except OSError as exc:
-            problems.append(f"{path} (unreadable: {clipped(exc.strerror or exc, 80)})")
-            continue
+        data = git(repo.top, "cat-file", "blob", blob, env=env).stdout
         if highlights.SECRET_TEXT.search(data.decode("utf-8", "replace")):
             problems.append(f"{path} (the content looks like a key, token or password; it is not printed)")
-    return problems
+    if problems:
+        raise GitRefusal(f"refusing to commit {len(problems)} file(s) that need review: {path_names(problems)}. "
+                         "Remove sensitive content or exclude the file from sync. Nothing was committed")
 
 
-def stage_snapshot(repo, core, config, env, include_untracked) -> None:
+def stage_snapshot(repo, core, env, include_untracked) -> None:
     """Stage the hub into the temporary index: every change to a tracked file, plus the untracked files
-    that rmem writes. Other untracked files are named and refused unless include_untracked; secret-looking
-    and oversized new files are always refused."""
-    git(repo.top, "add", "-u", "--", repo.spec, env=env)
+    that rmem writes. Other untracked files require include_untracked."""
+    tracked = git(repo.top, "ls-files", "-z", "--", repo.spec, env=env).stdout
+    if tracked:
+        git(repo.top, "add", "-u", "--", repo.spec, env=env)
     listing = git(repo.top, "ls-files", "--others", "--exclude-standard", "-z", "--", repo.spec, env=env)
     untracked = [path for path in nul_fields(listing) if not runtime_path(repo, path)]
     expected = [path for path in untracked if written_by_rmem(path[len(repo.prefix):], core)]
@@ -399,14 +397,45 @@ def stage_snapshot(repo, core, config, env, include_untracked) -> None:
                          "`rmem sync --embedded --include-untracked`, and move the others out of the hub or list "
                          "them in the hub's .gitignore. Nothing was committed")
     chosen = expected + (others if include_untracked else [])
-    problems = new_file_problems(repo, chosen, core, config)
-    if problems:
-        raise GitRefusal(f"refusing to commit {len(problems)} new file(s) that need a person's review: "
-                         f"{path_names(problems)}. Move them out of the hub or list them in its .gitignore; if you "
-                         "reviewed one and it belongs in Git, commit it yourself with `git add` and `git commit`. "
-                         "Nothing was committed")
     if chosen:
         git(repo.top, "update-index", "--add", "-z", "--stdin", data=os.fsencode("\0".join(chosen) + "\0"), env=env)
+
+
+def commit_standalone(repo, paths, memory_path, config, message):
+    """Keep the user's index intact on refusal and commit from the inspected index."""
+    index = repo.git_dir / "index"
+    lock = index.with_name("index.lock")
+    with tempfile.TemporaryDirectory(prefix="rmem-sync-", dir=repo.git_dir) as scratch:
+        staged_index = Path(scratch) / "index"
+        env = {"GIT_INDEX_FILE": str(staged_index)}
+        try:
+            fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            raise GitRefusal("Git is updating the index; finish that operation and retry") from None
+        os.close(fd)
+        try:
+            if index.exists():
+                shutil.copy2(index, staged_index)
+            ref, old = head(repo)
+            if in_progress(repo):
+                raise GitRefusal("finish the current Git operation before syncing")
+            staged = changed_paths(repo, old, env)
+            unrelated = [path for _, path in staged if not memory_path(path)]
+            if unrelated:
+                raise GitRefusal("unrelated staged files would be committed: " + path_names(unrelated))
+            if paths:
+                git(repo.top, "add", "-A", "--", *(literal(path) for path in sorted(paths)), env=env)
+            changes = changed_paths(repo, old, env)
+            if not changes:
+                return False
+            check_staged_files(repo, changes, config, env)
+            if head(repo) != (ref, old) or in_progress(repo):
+                raise GitRefusal("HEAD changed while staging memory; retry the sync")
+            git(repo.top, "commit", "-q", "-m", message, env=env)
+            os.replace(staged_index, index)
+        finally:
+            lock.unlink()
+    return True
 
 
 def drop_runtime_paths(repo, old, env) -> None:
@@ -518,7 +547,7 @@ def build_commits(repo, old, final, message, per_event, live, env, scratch):
     ledger_mode = entries[repo.ledger][0]
     commits, parent = [], old
     for (end, event), paths in zip(chunks, groups):
-        blob = output(git(repo.top, "hash-object", "-w", "--stdin", f"--path={repo.ledger}", data=live[:end], env=build))
+        blob = output(git(repo.top, "hash-object", "-w", "--stdin", data=live[:end], env=build))
         info = [f"{ledger_mode} {blob}\t{repo.ledger}"] + [f"{entries[p][0]} {entries[p][1]}\t{p}" for p in paths if p in entries]
         git(repo.top, "update-index", "-z", "--index-info", data=os.fsencode("\0".join(info) + "\0"), env=build)
         removed = [p for p in paths if p not in entries]
@@ -569,18 +598,19 @@ def cmd_sync_embedded(a, core):
             if ledger_ignored(repo):
                 raise GitRefusal(f"Git ignores {repo.ledger} in {repo.top}; remove the ignore rule that covers the hub "
                                  "before syncing memory")
-            live = core.safe_path(hub, "ledger.jsonl").read_bytes()
             if a.dry_run:
                 # WHY: objects go to a throwaway store, so a dry run leaves the repository byte for byte unchanged.
                 (Path(scratch) / "objects").mkdir()
                 env.update(GIT_OBJECT_DIRECTORY=str(Path(scratch) / "objects"),
                            GIT_ALTERNATE_OBJECT_DIRECTORIES=str(repo.common_dir / "objects"))
             git(repo.top, *(("read-tree", old) if old else ("read-tree", "--empty")), env=env)
-            stage_snapshot(repo, core, config, env, getattr(a, "include_untracked", False))
+            stage_snapshot(repo, core, env, getattr(a, "include_untracked", False))
             drop_runtime_paths(repo, old, env)
+            changes = changed_paths(repo, old, env)
+            check_staged_files(repo, changes, config, env, limit_new_files=True)
             final = output(git(repo.top, "write-tree", env=env))
+            live = git(repo.top, "cat-file", "blob", f"{final}:{repo.ledger}", env=env).stdout if a.per_event else b""
         base = output(git(repo.top, "rev-parse", f"{old}^{{tree}}")) if old else None
-        changes = changed_paths(repo, old, env)
         if final == base or (not old and not changes):
             print("no memory changes to commit")
             return 0

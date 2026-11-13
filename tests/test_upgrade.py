@@ -41,8 +41,9 @@ class UpgradeTests(unittest.TestCase):
                 stream.write("\n# changed in kit 0.9.0\n")
         (self.kit / "NEWDOC.md").write_text("# A document new in kit 0.9.0\n")
         source = (self.kit / "bin/rmem").read_text()
-        updated = source.replace('KIT_FILES = ("README.md",', 'KIT_FILES = ("NEWDOC.md", "README.md",', 1)
-        self.assertNotEqual(source, updated, "KIT_FILES literal changed shape; update this test")
+        marker = "KIT_FILES = ("
+        self.assertIn(marker, source)
+        updated = source.replace(marker, marker + '"NEWDOC.md", ', 1)
         (self.kit / "bin/rmem").write_text(updated)
 
     def call(self, *args, ok=True, env=None):
@@ -238,7 +239,7 @@ class UpgradeTests(unittest.TestCase):
     def test_kit_history_lists_the_released_versions(self):
         history = json.loads((KIT / "KIT_HISTORY.json").read_text())
         self.assertEqual(history["schema_version"], 1)
-        self.assertEqual([row["version"] for row in history["versions"]], ["0.2.0", "0.2.1", "0.3.0", "0.3.1"])
+        self.assertEqual([row["version"] for row in history["versions"]], ["0.2.0", "0.2.1", "0.3.0", "0.3.1", "0.4.0"])
         for row in history["versions"]:
             self.assertEqual(row["tag"], "v" + row["version"])
             self.assertIn("bin/rmem", row["files"])

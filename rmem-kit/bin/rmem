@@ -594,9 +594,9 @@ def load_plugins(hub: Path) -> None:
 
 
 def plugin_hub(argv):
-    """The validated hub whose plugins this command may load, or None: never with RMEM_NO_PLUGINS, for
-    top-level --help, init or version, or for a hub that does not validate."""
-    if os.environ.get("RMEM_NO_PLUGINS"):
+    """Load plugins only for the specific hub trusted by the caller's environment."""
+    trusted = Path(os.environ.get("RMEM_TRUSTED_PLUGIN_HUB", "")).expanduser()
+    if os.environ.get("RMEM_NO_PLUGINS") or not trusted.is_absolute():
         return None
     tokens = iter(argv)
     word = None
@@ -609,9 +609,12 @@ def plugin_hub(argv):
     if word in (None, "init", "version"):
         return None
     try:
-        return validate_hub(discover_hub()[0])
+        hub, _ = discover_hub()
+        if hub == trusted.resolve():
+            return validate_hub(hub)
     except (RmemError, OSError, UnicodeError, ValueError):
-        return None  # no hub yet, or a hub problem that the command itself reports
+        pass  # The command itself reports a missing or invalid hub.
+    return None
 
 
 def section_lines(ctx, hook: str) -> list:
@@ -2217,7 +2220,7 @@ def cmd_link(a):
 
 
 # Kit files init copies (and records in .kit-manifest.json); tracks append their own.
-KIT_FILES = ("README.md", "AGENTS.md", "CLAUDE.md", "BOOTSTRAP.md", "SKILL.md",
+KIT_FILES = ("LICENSE", "README.md", "AGENTS.md", "CLAUDE.md", "BOOTSTRAP.md", "SKILL.md",
              "findings/README.md", "RECORDS.md", "RECORD_TEMPLATE.json", "HIGHLIGHTS.md",
              "HIGHLIGHT_TEMPLATE.json", "CONSISTENCY.md", "INDEXED_READING.md",
              "CONTEXT_INDEX_TEMPLATE.json", "CONFIG.md", "HUB_CONFIG_TEMPLATE.json", "VERSION",
@@ -2307,20 +2310,19 @@ def cmd_sync(a):
                         "hub is its own repository)")
     hub = find_hub()
     who = actor(a)
+    config = load_config(hub)
+    message = one_line(a.message or f"rmem sync by {who['agent']}", "commit message", 1000)
     with hub_lock(hub):
         consistency_preflight(hub)
-        root = run_git(hub, "rev-parse", "--show-toplevel", check=False)
-        if root.returncode:
+        repo = research_git.repository(hub)
+        if repo is None:
             raise RmemError("the hub is not in a Git repository; run `git init` in the hub for a memory-only "
                             "repository, or keep it inside your project repository and use `rmem sync --embedded`")
-        if Path(root.stdout.strip()).resolve() != hub:
-            raise RmemError(f"the hub is inside the Git repository {root.stdout.strip()}, not its own repository; "
+        if repo.top != hub:
+            raise RmemError(f"the hub is inside the Git repository {repo.top}, not its own repository; "
                             "`rmem sync --embedded [--per-event]` commits only the hub files there (see GIT.md)")
-        staged = run_git(hub, "diff", "--cached", "--name-only", "-z").stdout.split("\0")
-        unrelated = [name for name in staged if name and not memory_path(name)]
-        if unrelated:
-            raise RmemError("unrelated staged files would be committed: " + clipped(", ".join(unrelated), 1000))
-        paths = {name for name in run_git(hub, "ls-files", "-z").stdout.split("\0") if name and memory_path(name)}
+        tracked = research_git.nul_fields(research_git.git(hub, "ls-files", "-z"))
+        paths = {name for name in tracked if memory_path(name)}
         paths.update(name for name in ("STATE.md", "MAP.md", "ledger.jsonl") if safe_path(hub, name).exists())
         for directory in MEMORY_DIRS:
             for path in safe_path(hub, directory).rglob("*"):
@@ -2331,21 +2333,8 @@ def cmd_sync(a):
                     paths.add(relative)
         for name in paths:
             safe_path(hub, name)
-        if paths:
-            run_git(hub, "add", "-A", "--", *sorted(paths))
-        staged = run_git(hub, "diff", "--cached", "--name-only", "-z").stdout.split("\0")
-        if any(name and not memory_path(name) for name in staged):
-            raise RmemError("staging changed concurrently; refusing to commit unrelated files")
-        pending = run_git(hub, "diff", "--cached", "--quiet", check=False)
-        if pending.returncode == 0:
-            print("no memory changes to commit")
-            return 0
-        if pending.returncode != 1:
-            raise RmemError("git could not inspect the staged memory changes")
-        message = a.message or f"rmem sync by {who['agent']}"
-        one_line(message, "commit message", 1000)
-        run_git(hub, "commit", "-q", "-m", message)
-    print("committed memory files")
+        committed = research_git.commit_standalone(repo, paths, memory_path, config, message)
+    print("committed memory files" if committed else "no memory changes to commit")
     return 0
 
 
@@ -2468,6 +2457,8 @@ def cmd_doctor(a):
         except RmemError as exc:
             out.add(f"- git: problem: {exc}")
     out.add("\n## Feature modules and plugins")
+    out.add("- Project plugins require RMEM_TRUSTED_PLUGIN_HUB set to this hub's absolute path. "
+            "RMEM_NO_PLUGINS disables them.")
     loaded = [entry.label for entry in feature_modules()]
     out.add(f"- loaded: {len(loaded)}" + (f" ({clipped(', '.join(loaded), 600)})" if loaded else ""))
     for label, broken in sorted(BROKEN_MODULES.items())[:20]:

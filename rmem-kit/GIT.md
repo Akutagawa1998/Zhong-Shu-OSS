@@ -39,11 +39,11 @@ python3 .research-memory/bin/rmem sync --embedded -m "Hub: weekly memory" # one 
   untracked file under the hub (a draft, a `.env`, a large binary) is named and
   the sync is refused; after reviewing them, `--include-untracked` commits them
   too, or move them out of the hub or list them in its `.gitignore`.
-- A new file whose name looks like a secret or key file, whose content looks
-  like a key, token or password, or that is larger than `storage.file_warn_mb`
-  (5 MB by default) is always refused and named, without printing its content.
-  Commit such a file yourself with `git add` if you reviewed it and it belongs
-  in Git; history keeps whatever is pushed.
+- Both sync modes check the staged contents of added and modified files for
+  common key, token and password patterns. They refuse non-regular files and
+  secret-looking paths, and report the affected file without printing its
+  contents. Embedded sync also limits new files outside `highlights/` to
+  `storage.file_warn_mb` (5 MB by default).
 - The output names the added, modified and deleted hub files (up to 30), in the
   dry run and in the real run.
 - Runtime and device-local files never go into a commit, even when an old
@@ -182,8 +182,6 @@ never run code from the checked-out tree:
   both sides' events; `check` reports the order change and highlights verify the
   captured events as an ordered subsequence.
 - rmem never pushes, pulls, rebases or force-updates a branch.
-- Whatever is committed and pushed stays in history. Ledger lines and note files
-  cannot be redacted without rewriting history, so `log`, `capture` and `note`
-  refuse text that looks like a key, token or password (`--allow-sensitive`
-  overrides after review), and `rmem run` records such arguments as `<redacted>`
-  (see [RECORDS.md](RECORDS.md)).
+- Keep hubs private. Sync checks recognizable credential patterns in changed
+  Git blobs. Review research notes, paths, session IDs and any artifacts before
+  sharing a hub. A push exposes both the current files and their history.

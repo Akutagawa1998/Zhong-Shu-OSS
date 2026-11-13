@@ -127,6 +127,7 @@ class WritePathTests(unittest.TestCase):
         self.call("log", "--thread", "alpha", "--note-file", body, ok=False)
         self.assertFalse((self.hub / "notes").exists())
         (self.hub / "bin/plugins/reject.py").write_text(REJECT_AT_APPEND)
+        self.env["RMEM_TRUSTED_PLUGIN_HUB"] = str(self.hub)
         refused = self.call("log", "--note", "reject at append", "--note-file", body, ok=False).stderr
         self.assertIn("refused by the test plugin", refused)
         self.assertEqual((self.hub / "ledger.jsonl").read_bytes(), before)
